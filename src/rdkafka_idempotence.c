@@ -438,7 +438,13 @@ void rd_kafka_idemp_request_pid_failed(rd_kafka_broker_t *rkb,
 
         rd_kafka_wrlock(rk);
 
-        if (rd_kafka_idemp_check_error(rk, err, errstr, rd_false)) {
+        if (rd_kafka_idemp_check_error(
+                rk, err, errstr,
+                rk->rk_conf.eos.transaction_tv2_required &&
+                    err != RD_KAFKA_RESP_ERR_NOT_COORDINATOR &&
+                    err != RD_KAFKA_RESP_ERR_COORDINATOR_NOT_AVAILABLE &&
+                    err != RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS &&
+                    err != RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS)) {
                 rd_kafka_wrunlock(rk);
                 return; /* Fatal error */
         }
@@ -482,6 +488,13 @@ void rd_kafka_idemp_pid_update(rd_kafka_broker_t *rkb,
                            "in state %s",
                            rd_kafka_pid2str(pid),
                            rd_kafka_idemp_state2str(rk->rk_eos.idemp_state));
+                rd_kafka_wrunlock(rk);
+                return;
+        }
+
+        if (rk->rk_conf.eos.transaction_tv2_required &&
+            (rd_kafka_fatal_error_code(rk) ||
+             rd_kafka_pid_valid(rk->rk_eos.pid))) {
                 rd_kafka_wrunlock(rk);
                 return;
         }
@@ -599,6 +612,12 @@ static RD_INLINE void rd_kafka_idemp_check_drain_done(rd_kafka_t *rk) {
  */
 void rd_kafka_idemp_drain_reset(rd_kafka_t *rk, const char *reason) {
         rd_kafka_wrlock(rk);
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                rd_kafka_idemp_check_error(rk, RD_KAFKA_RESP_ERR__INCONSISTENT,
+                                           reason, rd_true);
+                rd_kafka_wrunlock(rk);
+                return;
+        }
         rd_kafka_dbg(rk, EOS, "DRAIN",
                      "Beginning partition drain for %s reset "
                      "for %d partition(s) with in-flight requests: %s",
@@ -646,6 +665,11 @@ void rd_kafka_idemp_drain_epoch_bump0(rd_kafka_t *rk,
 
         rd_kafka_wrlock(rk);
 
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                rd_kafka_idemp_check_error(rk, err, buf, rd_true);
+                rd_kafka_wrunlock(rk);
+                return;
+        }
 
         if (requires_txn_abort) {
                 rd_kafka_dbg(rk, EOS, "DRAIN",

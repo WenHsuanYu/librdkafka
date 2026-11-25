@@ -31,6 +31,7 @@
 #include "rdkafka_buf.h"
 #include "rdkafka_broker.h"
 #include "rdkafka_interceptor.h"
+#include "rdunittest.h"
 
 void rd_kafka_buf_destroy_final(rd_kafka_buf_t *rkbuf) {
 
@@ -540,4 +541,106 @@ void rd_kafka_buf_set_maker(rd_kafka_buf_t *rkbuf,
         rkbuf->rkbuf_free_make_opaque_cb = free_make_opaque_cb;
 
         rkbuf->rkbuf_flags |= RD_KAFKA_OP_F_NEED_MAKE;
+}
+
+
+/** TV2 buffer protocol range and signed-count regressions. */
+static int do_unittest_uvarint_range(void) {
+        static const struct {
+                unsigned char wire[10];
+                size_t size;
+                size_t consumed;
+                uint64_t value;
+        } cases[] = {
+            {{0}, 1, 1, 0},
+            {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1},
+             10, 10, UINT64_MAX},
+            {{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2},
+             10, 0, 42},
+            {{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80},
+             10, 0, 42},
+        };
+        size_t i;
+
+        for (i = 0; i < RD_ARRAY_SIZE(cases); i++) {
+                rd_kafka_buf_t *rkbuf = rd_kafka_buf_new_shadow(
+                    cases[i].wire, cases[i].size, NULL);
+                uint64_t value = 42;
+                size_t consumed = rd_slice_read_uvarint(&rkbuf->rkbuf_reader,
+                                                         &value);
+
+                size_t offset = rd_slice_offset(&rkbuf->rkbuf_reader);
+                rd_kafka_buf_destroy(rkbuf);
+                RD_UT_ASSERT(consumed == cases[i].consumed &&
+                                 value == cases[i].value &&
+                                 offset == cases[i].consumed,
+                             "Slice uvarint range case %" PRIusz " failed", i);
+        }
+        RD_UT_PASS();
+}
+
+static rd_kafka_resp_err_t unittest_read_arraycnt(rd_kafka_buf_t *rkbuf,
+                                                 int32_t *count,
+                                                 int32_t maxval) {
+        const int log_decode_errors = 0;
+        rd_kafka_buf_read_arraycnt(rkbuf, count, maxval);
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+err_parse:
+        return rkbuf->rkbuf_err;
+}
+
+static int do_unittest_arraycnt_range(void) {
+        static const struct {
+                unsigned char wire[5];
+                size_t size;
+                int flags;
+                int32_t maxval;
+                int32_t count;
+                rd_kafka_resp_err_t err;
+        } cases[] = {
+            {{0}, 1, RD_KAFKA_OP_F_FLEXVER, -1, -1, 0},
+            {{1}, 1, RD_KAFKA_OP_F_FLEXVER, -1, 0, 0},
+            {{2}, 1, RD_KAFKA_OP_F_FLEXVER, 1, 1, 0},
+            {{3}, 1, RD_KAFKA_OP_F_FLEXVER, 1, 0, RD_KAFKA_RESP_ERR__BAD_MSG},
+            {{0x80, 0x80, 0x80, 0x80, 8}, 5, RD_KAFKA_OP_F_FLEXVER,
+             -1, INT32_MAX, 0},
+            {{0x81, 0x80, 0x80, 0x80, 8}, 5, RD_KAFKA_OP_F_FLEXVER,
+             -1, 0, RD_KAFKA_RESP_ERR__BAD_MSG},
+            {{0x82, 0x80, 0x80, 0x80, 0x10}, 5, RD_KAFKA_OP_F_FLEXVER,
+             1, 0, RD_KAFKA_RESP_ERR__BAD_MSG},
+            {{0xff, 0xff, 0xff, 0xff}, 4, 0, -1, -1, 0},
+            {{0, 0, 0, 1}, 4, 0, 1, 1, 0},
+            {{0xff, 0xff, 0xff, 0xfe}, 4, 0, -1, 0,
+             RD_KAFKA_RESP_ERR__BAD_MSG},
+        };
+        size_t i;
+
+        for (i = 0; i < RD_ARRAY_SIZE(cases); i++) {
+                rd_kafka_buf_t *rkbuf = rd_kafka_buf_new_shadow(
+                    cases[i].wire, cases[i].size, NULL);
+                int32_t count = 0;
+                rd_kafka_resp_err_t err;
+
+                rkbuf->rkbuf_flags = cases[i].flags;
+                err = unittest_read_arraycnt(rkbuf, &count, cases[i].maxval);
+                rd_kafka_buf_destroy(rkbuf);
+                RD_UT_ASSERT(err == cases[i].err &&
+                                 (err || count == cases[i].count),
+                             "Array count range case %" PRIusz
+                             ": error %d, count %" PRId32,
+                             i, err, count);
+        }
+        RD_UT_PASS();
+}
+
+#if defined(__GNUC__) && !defined(_WIN32)
+__attribute__((visibility("hidden")))
+#endif
+int unittest_rdkafka_buf_ranges(void) {
+        int fails = 0;
+
+        fails += do_unittest_uvarint_range();
+        fails += do_unittest_arraycnt_range();
+
+        return fails;
 }

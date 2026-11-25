@@ -404,6 +404,7 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                 struct {
                         rd_bool_t commit; /**< true = txn commit,
                                            *   false = txn abort */
+                        rd_kafka_pid_t pid; /**< Identity sent in EndTxn. */
                 } EndTxn;
         } rkbuf_u;
 
@@ -447,7 +448,7 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                                  ? "(flex)"                                    \
                                  : ""),                                        \
                             rd_slice_offset(&rkbuf->rkbuf_reader),             \
-                            rd_slice_size(&rkbuf->rkbuf_reader), __FUNCTION__, \
+                            rd_slice_size(&rkbuf->rkbuf_reader), __func__,     \
                             __LINE__);                                         \
                         rd_rkb_log(rkbuf->rkbuf_rkb, log_decode_errors,        \
                                    "PROTOERR", __VA_ARGS__);                   \
@@ -479,7 +480,7 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                             rd_kafka_ApiKey2str(rkbuf->rkbuf_reqhdr.ApiKey),   \
                             rkbuf->rkbuf_reqhdr.ApiVersion,                    \
                             rd_slice_offset(&rkbuf->rkbuf_reader),             \
-                            rd_slice_size(&rkbuf->rkbuf_reader), __FUNCTION__, \
+                            rd_slice_size(&rkbuf->rkbuf_reader), __func__,     \
                             __LINE__, wantedlen,                               \
                             rd_slice_remains(&rkbuf->rkbuf_reader),            \
                             rkbuf->rkbuf_uflow_mitigation                      \
@@ -558,14 +559,18 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 
 
 /**
- * Read a 16,32,64-bit integer and store it in 'dstptr'
+ * Read a 16,32,64-bit integer and store it in 'dstptr'.
+ * Byte-order conversion operates on unsigned wire bits. Exact-width signed
+ * types use two's complement; copy the host-order representation to retain
+ * negative values without an implementation-defined signed conversion.
  */
 #define rd_kafka_buf_read_i64(rkbuf, dstptr)                                   \
         do {                                                                   \
-                int64_t _v;                                                    \
+                uint64_t _v;                                                   \
                 int64_t *_vp = dstptr;                                         \
                 rd_kafka_buf_read(rkbuf, &_v, sizeof(_v));                     \
-                *_vp = be64toh(_v);                                            \
+                _v = be64toh(_v);                                              \
+                memcpy(_vp, &_v, sizeof(_v));                                  \
         } while (0)
 
 #define rd_kafka_buf_peek_i64(rkbuf, of, dstptr)                               \
@@ -578,10 +583,11 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 
 #define rd_kafka_buf_read_i32(rkbuf, dstptr)                                   \
         do {                                                                   \
-                int32_t _v;                                                    \
+                uint32_t _v;                                                   \
                 int32_t *_vp = dstptr;                                         \
                 rd_kafka_buf_read(rkbuf, &_v, sizeof(_v));                     \
-                *_vp = be32toh(_v);                                            \
+                _v = be32toh(_v);                                              \
+                memcpy(_vp, &_v, sizeof(_v));                                  \
         } while (0)
 
 #define rd_kafka_buf_peek_i32(rkbuf, of, dstptr)                               \
@@ -604,10 +610,11 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 
 #define rd_kafka_buf_read_i16(rkbuf, dstptr)                                   \
         do {                                                                   \
-                int16_t _v;                                                    \
+                uint16_t _v;                                                   \
                 int16_t *_vp = dstptr;                                         \
                 rd_kafka_buf_read(rkbuf, &_v, sizeof(_v));                     \
-                *_vp = (int16_t)be16toh(_v);                                   \
+                _v = be16toh(_v);                                              \
+                memcpy(_vp, &_v, sizeof(_v));                                  \
         } while (0)
 
 #define rd_kafka_buf_peek_i16(rkbuf, of, dstptr)                               \
@@ -620,9 +627,9 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 
 #define rd_kafka_buf_read_i16a(rkbuf, dst)                                     \
         do {                                                                   \
-                int16_t _v;                                                    \
-                rd_kafka_buf_read(rkbuf, &_v, 2);                              \
-                dst = (int16_t)be16toh(_v);                                    \
+                int16_t _signed_value;                                         \
+                rd_kafka_buf_read_i16(rkbuf, &_signed_value);                  \
+                dst = _signed_value;                                          \
         } while (0)
 
 #define rd_kafka_buf_read_i8(rkbuf, dst) rd_kafka_buf_read(rkbuf, dst, 1)
@@ -681,7 +688,10 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                 if ((rkbuf)->rkbuf_flags & RD_KAFKA_OP_F_FLEXVER) {            \
                         uint64_t _uva;                                         \
                         rd_kafka_buf_read_uvarint(rkbuf, &_uva);               \
-                        (kstr)->len = ((int32_t)_uva) - 1;                     \
+                        if (_uva > (uint64_t)INT32_MAX + 1)                    \
+                                rd_kafka_buf_parse_fail(                     \
+                                    rkbuf, "Compact string length out of range"); \
+                        (kstr)->len = _uva ? (int32_t)(_uva - 1) : -1;        \
                         _klen       = (kstr)->len;                             \
                 } else {                                                       \
                         rd_kafka_buf_read_i16a(rkbuf, (kstr)->len);            \
@@ -691,8 +701,10 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                         (kstr)->str = NULL;                                    \
                 else if (RD_KAFKAP_STR_LEN(kstr) == 0)                         \
                         (kstr)->str = "";                                      \
+                else if (_klen < 0)                                           \
+                        rd_kafka_buf_underflow_fail(rkbuf, (size_t)_klen);     \
                 else if (!((kstr)->str = rd_slice_ensure_contig(               \
-                               &rkbuf->rkbuf_reader, _klen)))                  \
+                               &rkbuf->rkbuf_reader, (size_t)_klen)))          \
                         rd_kafka_buf_check_len(rkbuf, _klen);                  \
         } while (0)
 
@@ -924,7 +936,10 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                 if ((rkbuf)->rkbuf_flags & RD_KAFKA_OP_F_FLEXVER) {            \
                         uint64_t _uva;                                         \
                         rd_kafka_buf_read_uvarint(rkbuf, &_uva);               \
-                        *(arrcnt) = (int32_t)_uva - 1;                         \
+                        if (_uva > (uint64_t)INT32_MAX + 1)                    \
+                                rd_kafka_buf_parse_fail(                      \
+                                    rkbuf, "Compact array count out of range"); \
+                        *(arrcnt) = _uva ? (int32_t)(_uva - 1) : -1;           \
                 } else {                                                       \
                         rd_kafka_buf_read_i32(rkbuf, arrcnt);                  \
                 }                                                              \

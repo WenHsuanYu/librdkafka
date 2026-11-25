@@ -45,6 +45,34 @@
 
 static void rd_kafka_txn_coord_timer_start(rd_kafka_t *rk, int timeout_ms);
 
+/** Required-TV2 offset staging is terminal on an unknown deadline outcome.
+ * The operation's original absolute clock deadline is never restarted. */
+static void rd_kafka_txn_offset_commit_deadline_cb(rd_kafka_timers_t *rkts,
+                                                   void *arg) {
+        rd_kafka_t *rk = arg;
+
+        (void)rkts;
+
+        if (!rk->rk_eos.txn_offset_commit_active)
+                return;
+
+        rk->rk_eos.txn_offset_commit_active = rd_false;
+        if (!rd_kafka_fatal_error(rk, NULL, 0))
+                rd_kafka_txn_set_fatal_error(
+                    rk, RD_DO_LOCK, RD_KAFKA_RESP_ERR__TIMED_OUT,
+                    "Required TV2 offset staging exceeded its absolute deadline");
+}
+
+/** Main-thread-only disarm: subsequent responses must not revive this API. */
+static void rd_kafka_txn_offset_commit_disarm(rd_kafka_t *rk) {
+        if (!rk->rk_eos.txn_offset_commit_active)
+                return;
+
+        rk->rk_eos.txn_offset_commit_active = rd_false;
+        rd_kafka_timer_stop(&rk->rk_timers,
+                            &rk->rk_eos.txn_offset_commit_tmr, 1);
+}
+
 #define rd_kafka_txn_curr_api_set_result(rk, actions, error)                   \
         rd_kafka_txn_curr_api_set_result0(__FUNCTION__, __LINE__, rk, actions, \
                                           error)
@@ -367,6 +395,11 @@ void rd_kafka_txn_set_abortable_error0(rd_kafka_t *rk,
         va_start(ap, fmt);
         vsnprintf(errstr, sizeof(errstr), fmt, ap);
         va_end(ap);
+
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                rd_kafka_txn_set_fatal_error(rk, RD_DO_LOCK, err, "%s", errstr);
+                return;
+        }
 
         rd_kafka_wrlock(rk);
 
@@ -1154,6 +1187,21 @@ static void rd_kafka_txn_register_partitions(rd_kafka_t *rk) {
                 return;
         }
 
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                rd_kafka_toppar_t *rktp;
+                /* Count before any partition is permitted to produce. Even
+                 * an uncertain send must prevent the empty-txn fast path. */
+                rk->rk_eos.txn_req_cnt = 1;
+                TAILQ_CONCAT(&rk->rk_eos.txn_waitresp_rktps,
+                             &rk->rk_eos.txn_pending_rktps, rktp_txnlink);
+                mtx_unlock(&rk->rk_eos.txn_pending_lock);
+                while ((rktp = TAILQ_FIRST(&rk->rk_eos.txn_waitresp_rktps)))
+                        rd_kafka_txn_partition_registered(rktp);
+                rd_kafka_all_brokers_wakeup(rk, RD_KAFKA_BROKER_STATE_INIT,
+                                            "TV2 implicit registration");
+                return;
+        }
+
 
         /* Send request to coordinator */
         err = rd_kafka_AddPartitionsToTxnRequest(
@@ -1471,6 +1519,120 @@ rd_kafka_txn_send_TxnOffsetCommitRequest(rd_kafka_broker_t *rkb,
                                          rd_kafka_resp_cb_t *resp_cb,
                                          void *reply_opaque);
 
+/* A broker's explicit concurrency rejection cannot have committed this
+ * offset mutation. Unknown outcomes must never be retried in required-TV2. */
+static rd_bool_t rd_kafka_tv2_offset_retry_allowed(
+    rd_kafka_resp_err_t err,
+    rd_ts_t now,
+    rd_ts_t abs_timeout,
+    rd_bool_t verified_ack) {
+        return verified_ack &&
+               err == RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS &&
+               abs_timeout > 0 && now < abs_timeout;
+}
+
+/**
+ * Validate the complete TV2 offset acknowledgement before reporting success.
+ * Match length-delimited topic names before converting them to C strings.
+ */
+static rd_kafka_resp_err_t rd_kafka_txn_parse_TV2_offset_ack(
+    rd_kafka_buf_t *rkbuf,
+    const rd_kafka_topic_partition_list_t *expected) {
+        const int log_decode_errors = LOG_ERR;
+        uint64_t topics, partitions;
+        rd_bool_t *seen;
+        rd_bool_t all_concurrent = rd_true;
+        int seen_count          = 0;
+        rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
+
+        if (!(rkbuf->rkbuf_flags & RD_KAFKA_OP_F_FLEXVER) || expected->cnt <= 0)
+                return RD_KAFKA_RESP_ERR__BAD_MSG;
+
+        seen = rd_calloc((size_t)expected->cnt, sizeof(*seen));
+        rd_kafka_buf_read_uvarint(rkbuf, &topics);
+        if (topics <= 1 || topics - 1 > (uint64_t)expected->cnt)
+                goto bad_msg;
+
+        for (; topics > 1; topics--) {
+                rd_kafkap_str_t topic;
+                int i;
+
+                rd_kafka_buf_read_str(rkbuf, &topic);
+                if (topic.len <= 0)
+                        goto bad_msg;
+
+                /* A topic must occur only once in the grouped response. */
+                for (i = 0; i < expected->cnt; i++) {
+                        if (seen[i] &&
+                            strlen(expected->elems[i].topic) ==
+                                (size_t)topic.len &&
+                            !memcmp(expected->elems[i].topic, topic.str,
+                                    (size_t)topic.len))
+                                goto bad_msg;
+                }
+
+                rd_kafka_buf_read_uvarint(rkbuf, &partitions);
+                if (partitions <= 1 ||
+                    partitions - 1 > (uint64_t)(expected->cnt - seen_count))
+                        goto bad_msg;
+
+                for (; partitions > 1; partitions--) {
+                        int32_t partition;
+                        int16_t code;
+                        int match = -1;
+
+                        rd_kafka_buf_read_i32(rkbuf, &partition);
+                        rd_kafka_buf_read_i16(rkbuf, &code);
+                        /* Internal negative errors are not valid broker codes.
+                         */
+                        if (code < RD_KAFKA_RESP_ERR_UNKNOWN)
+                                goto bad_msg;
+                        for (i = 0; i < expected->cnt; i++) {
+                                const rd_kafka_topic_partition_t *part =
+                                    &expected->elems[i];
+                                if (part->partition != partition ||
+                                    strlen(part->topic) != (size_t)topic.len ||
+                                    memcmp(part->topic, topic.str,
+                                           (size_t)topic.len))
+                                        continue;
+                                if (seen[i] || match != -1)
+                                        goto bad_msg;
+                                match = i;
+                        }
+                        if (match == -1)
+                                goto bad_msg;
+                        seen[match] = rd_true;
+                        seen_count++;
+                        if (code != RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS)
+                                all_concurrent = rd_false;
+                        if (!err && code)
+                                err = (rd_kafka_resp_err_t)code;
+                        rd_kafka_buf_skip_tags(rkbuf);
+                }
+                rd_kafka_buf_skip_tags(rkbuf);
+        }
+        rd_kafka_buf_skip_tags(rkbuf);
+        if (seen_count != expected->cnt ||
+            rd_slice_remains(&rkbuf->rkbuf_reader))
+                goto bad_msg;
+        /* A per-partition concurrency rejection is safe to retry only if
+         * every correlated partition was rejected. Mixing it with success
+         * leaves an uncertain partial mutation and must fail closed. */
+        if (err == RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS &&
+            !all_concurrent)
+                goto bad_msg;
+        goto done;
+
+bad_msg:
+        err = RD_KAFKA_RESP_ERR__BAD_MSG;
+        goto done;
+err_parse:
+        err = rkbuf->rkbuf_err ? rkbuf->rkbuf_err : RD_KAFKA_RESP_ERR__BAD_MSG;
+done:
+        rd_free(seen);
+        return err;
+}
+
 /**
  * @brief Handle TxnOffsetCommitResponse
  *
@@ -1487,6 +1649,7 @@ static void rd_kafka_txn_handle_TxnOffsetCommit(rd_kafka_t *rk,
         rd_kafka_op_t *rko                          = opaque;
         int actions                                 = 0;
         rd_kafka_topic_partition_list_t *partitions = NULL;
+        rd_bool_t verified_concurrent_ack           = rd_false;
         char errstr[512];
 
         *errstr = '\0';
@@ -1495,6 +1658,16 @@ static void rd_kafka_txn_handle_TxnOffsetCommit(rd_kafka_t *rk,
                 goto done;
 
         rd_kafka_buf_read_throttle_time(rkbuf);
+
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                err = rd_kafka_txn_parse_TV2_offset_ack(rkbuf,
+                                                        rko->rko_u.txn.offsets);
+                /* This code is only returned after validating every
+                 * correlated partition in the complete wire response. */
+                verified_concurrent_ack =
+                    err == RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS;
+                goto done;
+        }
 
         const rd_kafka_topic_partition_field_t fields[] = {
             RD_KAFKA_TOPIC_PARTITION_FIELD_PARTITION,
@@ -1540,6 +1713,62 @@ done:
 
         if (partitions)
                 rd_kafka_topic_partition_list_destroy(partitions);
+
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                /* A response parsed successfully after D is not a timely
+                 * acknowledgement. The main-thread timer may be delayed by
+                 * this very callback, so recheck the clock explicitly. */
+                if (!err && rko->rko_u.txn.abs_timeout &&
+                    rd_clock() >= rko->rko_u.txn.abs_timeout) {
+                        err = RD_KAFKA_RESP_ERR__TIMED_OUT;
+                        rd_snprintf(errstr, sizeof(errstr),
+                                    "Required TV2 offset acknowledgement "
+                                    "arrived after its absolute deadline");
+                }
+
+                /* CONCURRENT_TRANSACTIONS is a definitive broker rejection:
+                 * the previous TV2 EndTxn may be awaiting its markers and
+                 * this offset mutation was not admitted. Only this error may
+                 * be retried, and only before the original absolute deadline.
+                 * An unknown delivery outcome remains terminal/fail-closed. */
+                if (verified_concurrent_ack &&
+                    !rd_kafka_fatal_error(rk, NULL, 0)) {
+                        if (rd_kafka_tv2_offset_retry_allowed(
+                                err, rd_clock(), rko->rko_u.txn.abs_timeout,
+                                verified_concurrent_ack)) {
+                                rd_kafka_coord_req_abs_delayed(
+                                    rk, RD_KAFKA_COORD_GROUP,
+                                    rko->rko_u.txn.cgmetadata->group_id,
+                                    rd_kafka_txn_send_TxnOffsetCommitRequest,
+                                    rko, 20 /* backoff within original D */,
+                                    rko->rko_u.txn.abs_timeout,
+                                    RD_KAFKA_REPLYQ(rk->rk_ops, 0),
+                                    rd_kafka_txn_handle_TxnOffsetCommit, rko);
+                                return;
+                        }
+
+                        err = RD_KAFKA_RESP_ERR__TIMED_OUT;
+                        rd_snprintf(errstr, sizeof(errstr),
+                                    "Required TV2 offset retry exceeded its "
+                                    "original absolute deadline");
+                }
+
+                rd_kafka_txn_offset_commit_disarm(rk);
+                /* A previous timeout or fatal response already completed
+                 * this API. Never let a late callback affect the next one. */
+                if (rd_kafka_fatal_error(rk, NULL, 0)) {
+                        rd_kafka_op_destroy(rko);
+                        return;
+                }
+        }
+
+        if (rk->rk_conf.eos.transaction_tv2_required && err &&
+            err != RD_KAFKA_RESP_ERR__DESTROY &&
+            err != RD_KAFKA_RESP_ERR__OUTDATED) {
+                rd_kafka_txn_set_fatal_error(rk, RD_DO_LOCK, err, "%s", errstr);
+                rd_kafka_op_destroy(rko);
+                return;
+        }
 
         switch (err) {
         case RD_KAFKA_RESP_ERR_NO_ERROR:
@@ -1656,6 +1885,11 @@ rd_kafka_txn_send_TxnOffsetCommitRequest(rd_kafka_broker_t *rkb,
             rko->rko_u.txn.cgmetadata;
         int cnt;
 
+        if (rk->rk_conf.eos.transaction_tv2_required &&
+            (rd_kafka_fatal_error(rk, NULL, 0) ||
+             rd_clock() >= rko->rko_u.txn.abs_timeout))
+                return RD_KAFKA_RESP_ERR__TIMED_OUT;
+
         rd_kafka_rdlock(rk);
         if (rk->rk_eos.txn_state != RD_KAFKA_TXN_STATE_IN_TRANSACTION) {
                 rd_kafka_rdunlock(rk);
@@ -1674,8 +1908,12 @@ rd_kafka_txn_send_TxnOffsetCommitRequest(rd_kafka_broker_t *rkb,
                 return RD_KAFKA_RESP_ERR__STATE;
         }
 
-        ApiVersion = rd_kafka_broker_ApiVersion_supported(
-            rkb, RD_KAFKAP_TxnOffsetCommit, 0, 3, NULL);
+        if (rk->rk_conf.eos.transaction_tv2_required)
+                ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                    rkb, RD_KAFKAP_TxnOffsetCommit, 5, 5, NULL);
+        else
+                ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                    rkb, RD_KAFKAP_TxnOffsetCommit, 0, 3, NULL);
         if (ApiVersion == -1) {
                 /* Do not free the rko, it is passed as the reply_opaque
                  * on the reply queue by coord_req_fsm() when we return
@@ -1730,7 +1968,23 @@ rd_kafka_txn_send_TxnOffsetCommitRequest(rd_kafka_broker_t *rkb,
 
         rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
-        rkbuf->rkbuf_max_retries = RD_KAFKA_REQUEST_MAX_RETRIES;
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                /* Original API deadline, including coordinator discovery,
+                 * queueing, first send, and response; no automatic retry
+                 * of an offset mutation with an uncertain broker outcome. */
+                rkbuf->rkbuf_rel_timeout   = 0;
+                rkbuf->rkbuf_abs_timeout   = rko->rko_u.txn.abs_timeout;
+                rkbuf->rkbuf_force_timeout = rd_false;
+                rkbuf->rkbuf_max_retries   = 0;
+        } else {
+                rkbuf->rkbuf_max_retries = RD_KAFKA_REQUEST_MAX_RETRIES;
+        }
+
+        if (rk->rk_conf.eos.transaction_tv2_required &&
+            rd_clock() >= rko->rko_u.txn.abs_timeout) {
+                rd_kafka_buf_destroy(rkbuf);
+                return RD_KAFKA_RESP_ERR__TIMED_OUT;
+        }
 
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb,
                                        reply_opaque);
@@ -1969,6 +2223,34 @@ rd_kafka_txn_op_send_offsets_to_transaction(rd_kafka_t *rk,
          *  1) send AddOffsetsToTxnRequest to transaction coordinator.
          *  2) send TxnOffsetCommitRequest to group coordinator. */
 
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                rd_ts_t now = rd_clock();
+
+                if (now >= rko->rko_u.txn.abs_timeout) {
+                        rd_kafka_txn_set_fatal_error(
+                            rk, RD_DO_LOCK, RD_KAFKA_RESP_ERR__TIMED_OUT,
+                            "Required TV2 offset staging expired before "
+                            "coordinator discovery");
+                        return RD_KAFKA_OP_RES_HANDLED;
+                }
+
+                rk->rk_eos.txn_req_cnt = 1;
+                rk->rk_eos.txn_offset_commit_active = rd_true;
+                rd_kafka_timer_start_oneshot(
+                    &rk->rk_timers, &rk->rk_eos.txn_offset_commit_tmr,
+                    rd_true, rko->rko_u.txn.abs_timeout - now,
+                    rd_kafka_txn_offset_commit_deadline_cb, rk);
+
+                rd_kafka_coord_req_abs(
+                    rk, RD_KAFKA_COORD_GROUP,
+                    rko->rko_u.txn.cgmetadata->group_id,
+                    rd_kafka_txn_send_TxnOffsetCommitRequest, rko,
+                    rko->rko_u.txn.abs_timeout,
+                    RD_KAFKA_REPLYQ(rk->rk_ops, 0),
+                    rd_kafka_txn_handle_TxnOffsetCommit, rko);
+                return RD_KAFKA_OP_RES_KEEP;
+        }
+
         err = rd_kafka_AddOffsetsToTxnRequest(
             rk->rk_eos.txn_coord, rk->rk_conf.eos.transactional_id, pid,
             rko->rko_u.txn.cgmetadata->group_id, errstr, sizeof(errstr),
@@ -2084,6 +2366,12 @@ static void rd_kafka_txn_endtxn_complete(rd_kafka_t *rk) {
 
         rd_kafka_wrlock(rk);
 
+        if (rk->rk_conf.eos.transaction_tv2_required &&
+            rk->rk_eos.txn_state == RD_KAFKA_TXN_STATE_FATAL_ERROR) {
+                rd_kafka_wrunlock(rk);
+                return;
+        }
+
         /* If an epoch bump is required, let idempo handle it.
          * When the bump is finished we'll be notified through
          * idemp_state_change() and we can complete the local transaction state
@@ -2120,6 +2408,22 @@ static void rd_kafka_txn_endtxn_complete(rd_kafka_t *rk) {
  * @locality rdkafka main thread
  * @locks none
  */
+static rd_bool_t rd_kafka_tv2_endtxn_next_pid_valid(rd_kafka_pid_t previous,
+                                                    rd_kafka_pid_t next_pid) {
+        if (previous.id < 0 || previous.epoch < 0 || next_pid.id < 0)
+                return rd_false;
+
+        /* TV2 reserves the final signed-short epoch for coordinator fencing.
+         * At 32766 a successful EndTxn rotates to a new producer ID at epoch
+         * zero, without another InitProducerId call. */
+        if (previous.epoch == INT16_MAX - 1)
+                return next_pid.id != previous.id && next_pid.epoch == 0;
+
+        return previous.epoch < INT16_MAX - 1 &&
+               next_pid.id == previous.id &&
+               next_pid.epoch == (int)previous.epoch + 1;
+}
+
 static void rd_kafka_txn_handle_EndTxn(rd_kafka_t *rk,
                                        rd_kafka_broker_t *rkb,
                                        rd_kafka_resp_err_t err,
@@ -2130,6 +2434,7 @@ static void rd_kafka_txn_handle_EndTxn(rd_kafka_t *rk,
         int16_t ErrorCode;
         int actions = 0;
         rd_bool_t is_commit, may_retry = rd_false, require_bump = rd_false;
+        rd_kafka_pid_t next_pid = {.id = -1, .epoch = -1};
 
         if (err == RD_KAFKA_RESP_ERR__DESTROY)
                 return;
@@ -2142,6 +2447,13 @@ static void rd_kafka_txn_handle_EndTxn(rd_kafka_t *rk,
         rd_kafka_buf_read_throttle_time(rkbuf);
         rd_kafka_buf_read_i16(rkbuf, &ErrorCode);
         err = ErrorCode;
+        if (rk->rk_conf.eos.transaction_tv2_required && !err) {
+                rd_kafka_buf_read_i64(rkbuf, &next_pid.id);
+                rd_kafka_buf_read_i16(rkbuf, &next_pid.epoch);
+                rd_kafka_buf_skip_tags(rkbuf);
+                if (rd_slice_remains(&rkbuf->rkbuf_reader))
+                        err = RD_KAFKA_RESP_ERR__BAD_MSG;
+        }
         goto err;
 
 err_parse:
@@ -2149,6 +2461,37 @@ err_parse:
         /* FALLTHRU */
 
 err:
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                rd_kafka_pid_t previous = request->rkbuf_u.EndTxn.pid;
+                rd_kafka_wrlock(rk);
+                if (rk->rk_eos.txn_state == RD_KAFKA_TXN_STATE_FATAL_ERROR) {
+                        rd_kafka_wrunlock(rk);
+                        return;
+                }
+                if (!err &&
+                    (request->rkbuf_reqhdr.ApiVersion != 5 ||
+                     rk->rk_eos.txn_state !=
+                         (is_commit ? RD_KAFKA_TXN_STATE_COMMITTING_TRANSACTION
+                                    : RD_KAFKA_TXN_STATE_ABORTING_TRANSACTION) ||
+                     rk->rk_eos.idemp_state != RD_KAFKA_IDEMP_STATE_ASSIGNED ||
+                     !rd_kafka_pid_eq(previous, rk->rk_eos.pid) ||
+                     !rd_kafka_tv2_endtxn_next_pid_valid(previous, next_pid) ||
+                     rd_atomic32_get(&rk->rk_eos.inflight_toppar_cnt) != 0))
+                        err = RD_KAFKA_RESP_ERR__INCONSISTENT;
+                if (err) {
+                        rd_kafka_txn_set_fatal_error(
+                            rk, RD_DONT_LOCK, err,
+                            "TV2 EndTxn outcome or identity is unsafe: %s",
+                            rd_kafka_err2str(err));
+                        rd_kafka_wrunlock(rk);
+                        return;
+                }
+                rk->rk_eos.pid = next_pid;
+                rk->rk_eos.epoch_cnt++;
+                rd_kafka_wrunlock(rk);
+                rd_kafka_txn_endtxn_complete(rk);
+                return;
+        }
         rd_kafka_wrlock(rk);
 
         if (rk->rk_eos.txn_state == RD_KAFKA_TXN_STATE_COMMITTING_TRANSACTION) {
@@ -3203,6 +3546,9 @@ void rd_kafka_txn_coord_monitor_cb(rd_kafka_broker_t *rkb) {
  */
 void rd_kafka_txns_term(rd_kafka_t *rk) {
 
+        rd_kafka_txn_offset_commit_disarm(rk);
+        rd_kafka_timer_stop(&rk->rk_timers,
+                            &rk->rk_eos.txn_offset_commit_tmr, 1);
         RD_IF_FREE(rk->rk_eos.txn_errstr, rd_free);
         RD_IF_FREE(rk->rk_eos.txn_curr_api.error, rd_kafka_error_destroy);
 
@@ -3260,4 +3606,491 @@ void rd_kafka_txns_init(rd_kafka_t *rk) {
             rk->rk_eos.txn_coord, &rk->rk_eos.txn_coord->rkb_persistconn.coord);
 
         rd_atomic64_init(&rk->rk_eos.txn_dr_fails, 0);
+}
+
+/**
+ * @brief Test required-TV2 TxnOffsetCommit v5 acknowledgement validation.
+ *
+ * All cases use synthetic wire frames and the actual internal response
+ * callback. No running broker is required.
+ */
+static int unittest_txnmgr_tv2_ack(void) {
+#define TV2_ACK_THROTTLE 0, 0, 0, 0
+#define TV2_ACK_P0 0, 0, 0, 0, 0, 0, 0
+#define TV2_ACK_P1 0, 0, 0, 1, 0, 0, 0
+#define TV2_ACK_P1_NOT_COORD 0, 0, 0, 1, 0, 16, 0
+#define TV2_ACK_A 2, 'a', 3, TV2_ACK_P0, TV2_ACK_P1, 0
+#define TV2_ACK_B 2, 'b', 3, TV2_ACK_P0, TV2_ACK_P1, 0
+        static const struct {
+                const char *name;
+                unsigned char wire[64];
+                size_t size;
+                rd_kafka_resp_err_t expected;
+                rd_bool_t expired;
+                rd_bool_t multi;
+        } cases[] = {
+            {"valid",
+             {0, 0, 0, 0, 2, 2, 't', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+             17,
+             0, rd_false, rd_false},
+            {"null topics", {0, 0, 0, 0, 0, 0}, 6, RD_KAFKA_RESP_ERR__BAD_MSG,
+             rd_false, rd_false},
+            {"embedded NUL",
+             {0, 0, 0, 0, 2, 4, 't', 0, 'x', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+             19,
+             RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_false},
+            {"null partitions",
+             {0, 0, 0, 0, 3, 2, 'x', 0, 0, 2, 't',
+              2, 0, 0, 0, 0, 0, 0,   0, 0, 0},
+             21,
+             RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_false},
+            {"oversized count",
+             {0, 0, 0, 0, 0x82, 0x80, 0x80, 0x80, 0x10, 2, 't',
+              2, 0, 0, 0, 0,    0,    0,    0,    0,    0},
+             21,
+             RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_false},
+            {"wrong partition",
+             {0, 0, 0, 0, 2, 2, 't', 2, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+             17,
+             RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_false},
+            {"trailing",
+             {0, 0, 0, 0, 2, 2, 't', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+             18,
+             RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_false},
+            {"truncated",
+             {0, 0, 0, 0, 2, 2, 't', 2, 0, 0, 0, 0, 0, 0, 0, 0},
+             16,
+             RD_KAFKA_RESP_ERR__UNDERFLOW, rd_false, rd_false},
+            {"broker error",
+             {0, 0, 0, 0, 2, 2, 't', 2, 0, 0, 0, 0, 0, 16, 0, 0, 0},
+             17,
+             RD_KAFKA_RESP_ERR_NOT_COORDINATOR, rd_false, rd_false},
+            {"invalid negative error",
+             {0, 0, 0, 0, 2, 2, 't', 2, 0, 0, 0, 0, 0xff, 0x38, 0, 0, 0},
+             17,
+             RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_false},
+            {"unknown server error",
+             {0, 0, 0, 0, 2, 2, 't', 2, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0},
+             17,
+             RD_KAFKA_RESP_ERR_UNKNOWN, rd_false, rd_false},
+            {"duplicate partition",
+             {0, 0, 0, 0, 2, 2, 't', 3, 0, 0, 0, 0,
+              0, 0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0},
+             24,
+             RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_false},
+            {"late valid ACK",
+             {0, 0, 0, 0, 2, 2, 't', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+             17,
+             RD_KAFKA_RESP_ERR__TIMED_OUT,
+             rd_true, rd_false},
+            {"multi reordered success",
+             {TV2_ACK_THROTTLE, 3, 2, 'b', 3, TV2_ACK_P1, TV2_ACK_P0, 0,
+              2, 'a', 3, TV2_ACK_P1, TV2_ACK_P0, 0, 0},
+             42, 0, rd_false, rd_true},
+            {"multi missing expected partition",
+             {TV2_ACK_THROTTLE, 3, 2, 'a', 2, TV2_ACK_P0, 0,
+              TV2_ACK_B, 0},
+             35, RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_true},
+            {"multi duplicate partition with preserved cardinality",
+             {TV2_ACK_THROTTLE, 3, 2, 'a', 3, TV2_ACK_P0, TV2_ACK_P0, 0,
+              TV2_ACK_B, 0},
+             42, RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_true},
+            {"multi duplicate topic with disjoint partitions",
+             {TV2_ACK_THROTTLE, 4, 2, 'a', 2, TV2_ACK_P0, 0,
+              2, 'a', 2, TV2_ACK_P1, 0, TV2_ACK_B, 0},
+             46, RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_true},
+            {"multi null inner partition array",
+             {TV2_ACK_THROTTLE, 4, 2, 'x', 0, 0, TV2_ACK_A,
+              TV2_ACK_B, 0},
+             46, RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_true},
+            {"multi embedded topic NUL",
+             {TV2_ACK_THROTTLE, 3, 4, 'a', 0, 'x', 3,
+              TV2_ACK_P0, TV2_ACK_P1, 0, TV2_ACK_B, 0},
+             44, RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_true},
+            {"multi compact topic count overflow",
+             {TV2_ACK_THROTTLE, 0x83, 0x80, 0x80, 0x80, 0x10,
+              TV2_ACK_A, TV2_ACK_B, 0},
+             46, RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_true},
+            {"multi compact partition count overflow",
+             {TV2_ACK_THROTTLE, 3, 2, 'a',
+              0x83, 0x80, 0x80, 0x80, 0x10, TV2_ACK_P0,
+              TV2_ACK_P1, 0, TV2_ACK_B, 0},
+             46, RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_true},
+            {"multi not coordinator unknown outcome",
+             {TV2_ACK_THROTTLE, 3, 2, 'a', 3,
+              TV2_ACK_P0, TV2_ACK_P1_NOT_COORD, 0, TV2_ACK_B, 0},
+             42, RD_KAFKA_RESP_ERR_NOT_COORDINATOR, rd_false, rd_true},
+            {"multi mixed broker error and malformed remainder",
+             {TV2_ACK_THROTTLE, 3, 2, 'a', 3,
+              TV2_ACK_P0, TV2_ACK_P1_NOT_COORD, 0, TV2_ACK_B, 0, 0},
+             43, RD_KAFKA_RESP_ERR__BAD_MSG, rd_false, rd_true},
+        };
+#undef TV2_ACK_THROTTLE
+#undef TV2_ACK_P0
+#undef TV2_ACK_P1
+#undef TV2_ACK_P1_NOT_COORD
+#undef TV2_ACK_A
+#undef TV2_ACK_B
+        size_t i;
+        int fails = 0;
+
+        for (i = 0; i < RD_ARRAY_SIZE(cases); i++) {
+                rd_kafka_conf_t *conf = rd_kafka_conf_new();
+                rd_kafka_t *rk;
+                rd_kafka_broker_t *rkb;
+                rd_kafka_op_t *rko;
+                rd_kafka_buf_t *request, *reply;
+                rd_kafka_error_t *error;
+                rd_kafka_resp_err_t actual;
+                char fatal_message[256];
+                rd_bool_t result_ok;
+
+                if (rd_kafka_conf_set(conf, "transactional.id", "unit-offset",
+                                      NULL, 0) != RD_KAFKA_CONF_OK ||
+                    rd_kafka_conf_set(conf, "transaction.tv2.required", "true",
+                                      NULL, 0) != RD_KAFKA_CONF_OK) {
+                        rd_kafka_conf_destroy(conf);
+                        return fails + 1;
+                }
+                rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, NULL, 0);
+                if (!rk) {
+                        rd_kafka_conf_destroy(conf);
+                        return fails + 1;
+                }
+                rkb = rd_kafka_broker_add_logical(rk, "unittest-offset");
+                rd_kafka_wrlock(rk);
+                rk->rk_eos.txn_state = RD_KAFKA_TXN_STATE_IN_TRANSACTION;
+                rd_atomic32_set(&rk->rk_eos.txn_may_enq, 1);
+                rd_kafka_wrunlock(rk);
+                error = rd_kafka_txn_curr_api_begin(
+                    rk, "send_offsets_to_transaction", rd_false, 0, NULL);
+                if (error) {
+                        rd_kafka_error_destroy(error);
+                        rd_kafka_broker_destroy(rkb);
+                        rd_kafka_destroy(rk);
+                        return fails + 1;
+                }
+                rko                    = rd_kafka_op_new(RD_KAFKA_OP_TXN);
+                rko->rko_u.txn.offsets =
+                    rd_kafka_topic_partition_list_new(cases[i].multi ? 4 : 1);
+                if (cases[i].expired)
+                        rko->rko_u.txn.abs_timeout = rd_clock() - 1;
+                if (cases[i].multi) {
+                        rd_kafka_topic_partition_list_add(
+                            rko->rko_u.txn.offsets, "a", 0)->offset = 1;
+                        rd_kafka_topic_partition_list_add(
+                            rko->rko_u.txn.offsets, "a", 1)->offset = 1;
+                        rd_kafka_topic_partition_list_add(
+                            rko->rko_u.txn.offsets, "b", 0)->offset = 1;
+                        rd_kafka_topic_partition_list_add(
+                            rko->rko_u.txn.offsets, "b", 1)->offset = 1;
+                } else {
+                        rd_kafka_topic_partition_list_add(
+                            rko->rko_u.txn.offsets, "t", 0)->offset = 1;
+                }
+                request                          = rd_kafka_buf_new(0, 0);
+                request->rkbuf_reqhdr.ApiKey     = RD_KAFKAP_TxnOffsetCommit;
+                request->rkbuf_reqhdr.ApiVersion = 5;
+                reply =
+                    rd_kafka_buf_new_shadow(cases[i].wire, cases[i].size, NULL);
+                reply->rkbuf_flags = RD_KAFKA_OP_F_FLEXVER;
+                rd_kafka_broker_keep(rkb);
+                reply->rkbuf_rkb = rkb;
+
+                rd_kafka_txn_handle_TxnOffsetCommit(rk, rkb, 0, reply, request,
+                                                     rko);
+                actual = rd_kafka_fatal_error(rk, fatal_message,
+                                              sizeof(fatal_message));
+                mtx_lock(&rk->rk_eos.txn_curr_api.lock);
+                error = rk->rk_eos.txn_curr_api.error;
+                result_ok =
+                    rk->rk_eos.txn_curr_api.has_result &&
+                    (cases[i].expected
+                         ? error && rd_kafka_error_is_fatal(error) &&
+                               rd_kafka_error_code(error) == cases[i].expected
+                         : !error);
+                rk->rk_eos.txn_curr_api.has_result = rd_false;
+                rk->rk_eos.txn_curr_api.error      = NULL;
+                mtx_unlock(&rk->rk_eos.txn_curr_api.lock);
+                (void)rd_kafka_txn_curr_api_return0(
+                    RD_UT_FUNCTION_NAME, __LINE__, rk, rd_false, error);
+                rd_kafka_error_destroy(error);
+                if (actual != cases[i].expected || !result_ok ||
+                    (cases[i].expected &&
+                     rd_atomic32_get(&rk->rk_eos.txn_may_enq))) {
+                        RD_UT_SAY("TV2 offset case %s: expected %d, got %d, "
+                                  "result_ok=%d",
+                                  cases[i].name, cases[i].expected, actual,
+                                  result_ok);
+                        fails++;
+                }
+                rd_kafka_buf_destroy(reply);
+                rd_kafka_buf_destroy(request);
+                rd_kafka_broker_destroy(rkb);
+                rd_kafka_destroy(rk);
+        }
+        return fails;
+}
+
+static int unittest_txnmgr_tv2_endtxn_pid_boundary(void) {
+        static const struct {
+                rd_kafka_pid_t before;
+                rd_kafka_pid_t after;
+                rd_bool_t expected;
+        } cases[] = {
+            {{42, 0}, {42, 1}, rd_true},
+            {{42, 32765}, {42, 32766}, rd_true},
+            {{42, 32766}, {73, 0}, rd_true},
+            {{42, 0}, {73, 1}, rd_false},
+            {{42, 0}, {42, 2}, rd_false},
+            {{42, 32766}, {42, 32767}, rd_false},
+            {{42, 32766}, {73, 1}, rd_false},
+            {{42, 32766}, {42, 0}, rd_false},
+            {{42, 32767}, {73, 0}, rd_false},
+            {{-1, 0}, {73, 0}, rd_false},
+            {{42, -1}, {73, 0}, rd_false},
+            {{42, 32766}, {-1, 0}, rd_false},
+        };
+        size_t i;
+
+        for (i = 0; i < RD_ARRAY_SIZE(cases); i++) {
+                rd_bool_t actual = rd_kafka_tv2_endtxn_next_pid_valid(
+                    cases[i].before, cases[i].after);
+                RD_UT_ASSERT(actual == cases[i].expected,
+                             "TV2 EndTxn PID boundary case %" PRIusz
+                             ": expected %d, got %d",
+                             i, cases[i].expected, actual);
+        }
+        RD_UT_PASS();
+}
+
+/** Exercise the real v5 EndTxn response callback at the rollover boundary. */
+static int unittest_txnmgr_tv2_endtxn_callback(void) {
+        static const struct {
+                const char *name;
+                rd_kafka_pid_t request_pid;
+                rd_kafka_pid_t response_pid;
+                rd_bool_t stale;
+                rd_bool_t expected_success;
+        } cases[] = {
+            {"normal epoch bump", {42, 32765}, {42, 32766}, rd_false, rd_true},
+            {"valid rollover", {42, 32766}, {73, 0}, rd_false, rd_true},
+            {"forbidden final epoch", {42, 32766}, {42, 32767}, rd_false,
+             rd_false},
+            {"incorrect rollover epoch", {42, 32766}, {73, 1}, rd_false,
+             rd_false},
+            {"unexpected producer id", {42, 0}, {73, 1}, rd_false, rd_false},
+            {"stale request identity", {42, 32766}, {73, 0}, rd_true,
+             rd_false},
+        };
+        size_t i;
+        int fails = 0;
+
+        for (i = 0; i < RD_ARRAY_SIZE(cases); i++) {
+                rd_kafka_conf_t *conf = rd_kafka_conf_new();
+                rd_kafka_t *rk;
+                rd_kafka_broker_t *rkb;
+                rd_kafka_buf_t *request, *reply;
+                rd_kafka_error_t *error;
+                unsigned char wire[17] = {0};
+                rd_kafka_pid_t current;
+                rd_kafka_resp_err_t fatal;
+                rd_bool_t success;
+                uint64_t raw_pid = (uint64_t)cases[i].response_pid.id;
+                uint16_t raw_epoch = (uint16_t)cases[i].response_pid.epoch;
+                char fatal_message[256];
+                int j;
+
+                if (rd_kafka_conf_set(conf, "transactional.id", "ut-endtxn",
+                                      NULL, 0) != RD_KAFKA_CONF_OK ||
+                    rd_kafka_conf_set(conf, "transaction.tv2.required", "true",
+                                      NULL, 0) != RD_KAFKA_CONF_OK) {
+                        rd_kafka_conf_destroy(conf);
+                        return fails + 1;
+                }
+                rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, NULL, 0);
+                if (!rk) {
+                        rd_kafka_conf_destroy(conf);
+                        return fails + 1;
+                }
+                rkb = rd_kafka_broker_add_logical(rk, "unittest-endtxn");
+
+                rd_kafka_wrlock(rk);
+                rk->rk_eos.pid = cases[i].request_pid;
+                if (cases[i].stale)
+                        rk->rk_eos.pid.id++;
+                rk->rk_eos.idemp_state = RD_KAFKA_IDEMP_STATE_ASSIGNED;
+                rk->rk_eos.txn_state =
+                    RD_KAFKA_TXN_STATE_COMMITTING_TRANSACTION;
+                rd_kafka_wrunlock(rk);
+                error = rd_kafka_txn_curr_api_begin(
+                    rk, "commit_transaction", rd_false, 0, NULL);
+                if (error) {
+                        rd_kafka_error_destroy(error);
+                        rd_kafka_broker_destroy(rkb);
+                        rd_kafka_destroy(rk);
+                        return fails + 1;
+                }
+
+                request = rd_kafka_buf_new(0, 0);
+                request->rkbuf_reqhdr.ApiKey = RD_KAFKAP_EndTxn;
+                request->rkbuf_reqhdr.ApiVersion = 5;
+                request->rkbuf_u.EndTxn.commit = rd_true;
+                request->rkbuf_u.EndTxn.pid = cases[i].request_pid;
+                for (j = 0; j < 8; j++)
+                        wire[6 + j] = (unsigned char)(raw_pid >> (56 - j * 8));
+                wire[14] = (unsigned char)(raw_epoch >> 8);
+                wire[15] = (unsigned char)raw_epoch;
+                reply = rd_kafka_buf_new_shadow(wire, sizeof(wire), NULL);
+                reply->rkbuf_flags = RD_KAFKA_OP_F_FLEXVER;
+                rd_kafka_broker_keep(rkb);
+                reply->rkbuf_rkb = rkb;
+
+                rd_kafka_txn_handle_EndTxn(rk, rkb, 0, reply, request, NULL);
+                fatal = rd_kafka_fatal_error(rk, fatal_message,
+                                              sizeof(fatal_message));
+                rd_kafka_rdlock(rk);
+                current = rk->rk_eos.pid;
+                success = rk->rk_eos.txn_state ==
+                          RD_KAFKA_TXN_STATE_COMMIT_NOT_ACKED;
+                rd_kafka_rdunlock(rk);
+                if (cases[i].expected_success
+                        ? fatal || !success ||
+                              !rd_kafka_pid_eq(current, cases[i].response_pid)
+                        : !fatal || success ||
+                              (cases[i].stale
+                                   ? current.id != cases[i].request_pid.id + 1
+                                   : !rd_kafka_pid_eq(current,
+                                                      cases[i].request_pid))) {
+                        RD_UT_SAY("TV2 EndTxn response case %s: fatal %d, "
+                                  "success %d, current %s",
+                                  cases[i].name, fatal, success,
+                                  rd_kafka_pid2str(current));
+                        fails++;
+                }
+
+                (void)rd_kafka_txn_curr_api_return0(
+                    RD_UT_FUNCTION_NAME, __LINE__, rk, rd_false, NULL);
+                rd_kafka_buf_destroy(reply);
+                rd_kafka_buf_destroy(request);
+                rd_kafka_broker_destroy(rkb);
+                rd_kafka_destroy(rk);
+        }
+        RD_UT_ASSERT(fails == 0, "TV2 EndTxn response: %d failures", fails);
+        RD_UT_PASS();
+}
+
+static int unittest_txnmgr_tv2_offset_retry_policy(void) {
+        static const struct {
+                rd_kafka_resp_err_t err;
+                rd_ts_t now;
+                rd_ts_t deadline;
+                rd_bool_t verified_ack;
+                rd_bool_t allowed;
+        } cases[] = {
+            {RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS, 99, 100, rd_true,
+             rd_true},
+            {RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS, 99, 100, rd_false,
+             rd_false},
+            {RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS, 100, 100, rd_true,
+             rd_false},
+            {RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS, 101, 100, rd_true,
+             rd_false},
+            {RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS, 0, 0, rd_true, rd_false},
+            {RD_KAFKA_RESP_ERR__TIMED_OUT, 99, 100, rd_true, rd_false},
+            {RD_KAFKA_RESP_ERR__TRANSPORT, 99, 100, rd_true, rd_false},
+            {RD_KAFKA_RESP_ERR_NOT_COORDINATOR, 99, 100, rd_true, rd_false},
+            {RD_KAFKA_RESP_ERR__BAD_MSG, 99, 100, rd_true, rd_false},
+            {RD_KAFKA_RESP_ERR_UNKNOWN, 99, 100, rd_true, rd_false},
+            {RD_KAFKA_RESP_ERR_NO_ERROR, 99, 100, rd_true, rd_false},
+        };
+        size_t i;
+
+        for (i = 0; i < RD_ARRAY_SIZE(cases); i++) {
+                rd_bool_t allowed = rd_kafka_tv2_offset_retry_allowed(
+                    cases[i].err, cases[i].now, cases[i].deadline,
+                    cases[i].verified_ack);
+                RD_UT_ASSERT(allowed == cases[i].allowed,
+                             "TV2 definitive offset rejection case %" PRIusz
+                             ": expected retry %d got %d",
+                             i, cases[i].allowed, allowed);
+        }
+        RD_UT_PASS();
+}
+
+/** A retryable offset rejection must cover the entire correlated request. */
+static int unittest_txnmgr_tv2_ack_mixed_partitions(void) {
+        static const unsigned char wire_template[24] = {
+            0, 0, 0, 0, 2, 2, 'a', 3,
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 1, 0, 0, 0,
+            0, 0};
+        static const struct {
+                int16_t first;
+                int16_t second;
+                rd_kafka_resp_err_t expected;
+        } cases[] = {
+            {0, 0, RD_KAFKA_RESP_ERR_NO_ERROR},
+            {RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS,
+             RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS,
+             RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS},
+            {RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS, 0,
+             RD_KAFKA_RESP_ERR__BAD_MSG},
+            {0, RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS,
+             RD_KAFKA_RESP_ERR__BAD_MSG},
+            {RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS,
+             RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+             RD_KAFKA_RESP_ERR__BAD_MSG},
+            {RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+             RD_KAFKA_RESP_ERR_CONCURRENT_TRANSACTIONS,
+             RD_KAFKA_RESP_ERR_NOT_COORDINATOR},
+            {RD_KAFKA_RESP_ERR_NOT_COORDINATOR, 0,
+             RD_KAFKA_RESP_ERR_NOT_COORDINATOR},
+        };
+        size_t i;
+
+        for (i = 0; i < RD_ARRAY_SIZE(cases); i++) {
+                unsigned char wire[sizeof(wire_template)];
+                rd_kafka_buf_t *reply;
+                rd_kafka_topic_partition_list_t *expected;
+                rd_kafka_resp_err_t actual;
+
+                memcpy(wire, wire_template, sizeof(wire));
+                wire[12] = (unsigned char)(cases[i].first >> 8);
+                wire[13] = (unsigned char)cases[i].first;
+                wire[19] = (unsigned char)(cases[i].second >> 8);
+                wire[20] = (unsigned char)cases[i].second;
+                expected = rd_kafka_topic_partition_list_new(2);
+                rd_kafka_topic_partition_list_add(expected, "a", 0);
+                rd_kafka_topic_partition_list_add(expected, "a", 1);
+                /* The handler already consumed the four-byte throttle. */
+                reply = rd_kafka_buf_new_shadow(wire + 4,
+                                                sizeof(wire) - 4, NULL);
+                reply->rkbuf_flags = RD_KAFKA_OP_F_FLEXVER;
+                actual = rd_kafka_txn_parse_TV2_offset_ack(reply, expected);
+                rd_kafka_buf_destroy(reply);
+                rd_kafka_topic_partition_list_destroy(expected);
+                RD_UT_ASSERT(actual == cases[i].expected,
+                             "TV2 mixed partition ACK case %" PRIusz
+                             ": expected %d got %d",
+                             i, cases[i].expected, actual);
+        }
+        RD_UT_PASS();
+}
+
+/* The registry calls this within librdkafka; avoid growing its dynamic ABI. */
+#if defined(__GNUC__) && !defined(_WIN32)
+__attribute__((visibility("hidden")))
+#endif
+int unittest_txnmgr_tv2(void) {
+        int fails = unittest_txnmgr_tv2_ack();
+
+        fails += unittest_txnmgr_tv2_endtxn_pid_boundary();
+        fails += unittest_txnmgr_tv2_endtxn_callback();
+        fails += unittest_txnmgr_tv2_offset_retry_policy();
+        fails += unittest_txnmgr_tv2_ack_mixed_partitions();
+
+        RD_UT_ASSERT(fails == 0, "TV2 transaction unit tests: %d failures",
+                     fails);
+        RD_UT_PASS();
 }

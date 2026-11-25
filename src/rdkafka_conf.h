@@ -500,6 +500,7 @@ struct rd_kafka_conf_s {
                  */
                 char *transactional_id;     /**< Transactional Id */
                 int transaction_timeout_ms; /**< Transaction timeout */
+                int transaction_tv2_required; /**< Require TV2 protocol. */
         } eos;
         int queue_buffering_max_msgs;
         int queue_buffering_max_kbytes;

@@ -1,5 +1,98 @@
 # Automated regression tests for librdkafka
 
+## Native testing policy and execution
+
+**Use the repository's native testing framework for all new or changed tests**,
+including unit, mock, and real-broker tests. Do not add GoogleTest, Catch2, or a
+parallel test harness. The test executable
+is `tests/test-runner`, implemented by `tests/test.c` and `tests/test.h`.
+`tests/Makefile` (via `run-test.sh`) and CMake/CTest launch that runner; CTest
+registers runner modes, not individual internal tests. The runner owns test
+selection, concurrency (`-pN`), timeouts, assertions, reporting, and cleanup.
+
+There are two native registration paths:
+
+1. **Numbered C/C++ tests** live in `tests/0nnn-*.c` or `.cpp`. Define
+   `main_0nnn_name(int argc, char **argv)`, add its declaration and registry
+   entry to `tests/test.c`, and add the file to `tests/CMakeLists.txt` and the
+   Windows `win32/tests/tests.vcxproj` when applicable. `tests/Makefile` picks
+   up matching filenames automatically. Use `TEST_ASSERT`, `TEST_FAIL`,
+   `TEST_SAY`, `SUB_TEST`, and `SUB_TEST_PASS`, not a second assertion engine.
+   Mark broker-independent tests `TEST_F_LOCAL` in the runner's registration
+   table. A mock cluster is not a real Kafka broker.
+2. **Internal unit tests** are exposed through `rd_kafka_unittest()` in
+   `src/rdunittest.c`, invoked by numbered test `0000-unittests.c`. Keep
+   internal-only assertions in the native unit-test pattern and register them
+   in the existing unit-test registry. Select one family using `RD_UT_TEST`.
+   Avoid creating production test-only public APIs solely to support a test.
+
+Run these commands from `tests/` after building the library and test runner
+with the same source and compatible build options:
+
+```sh
+make unit                                  # 0000 internal unit suites
+TESTS=0000 RD_UT_TEST=rdbuf make          # one internal unit-test family
+TESTS=0nnn make                           # one numbered test (replace 0nnn)
+make run_local                             # brokerless numbered tests
+make quick                                 # condensed runner selection
+make run_seq                               # sequential runner
+```
+
+For a CMake build, keep `RDKAFKA_BUILD_TESTS=ON`, build `test-runner`, and
+invoke `ctest` in that build directory or execute the built `test-runner`
+directly with `TESTS`/`RD_UT_TEST`. Keep only CTest's original parallel,
+sequential, brokerless, and brokerless-quick entries: they invoke the native
+runner and are not an independent assertion or registration framework.
+
+For changes to the fork's required-TV2 protocol, run `0000` with all four
+relevant `RD_UT_TEST` filters: `tv2_txnmgr` (TxnOffsetCommit v5 complete ACK,
+mixed-partition failure, original-deadline retry and EndTxn PID rollover),
+`request` (Produce response validation and wire readers), `broker`
+(send-admission deadline), and `rdbuf` (existing buffer tests plus the new
+`rdbuf_ranges` registry family for varint/array bounds). For
+example, from the CMake build's `tests/` directory:
+
+```sh
+TESTS=0000 RD_UT_TEST=tv2_txnmgr ./test-runner -p1 -l -Q
+TESTS=0000 RD_UT_TEST=request   ./test-runner -p1 -l -Q
+TESTS=0000 RD_UT_TEST=broker    ./test-runner -p1 -l -Q
+TESTS=0000 RD_UT_TEST=rdbuf     ./test-runner -p1 -l -Q
+TESTS=0000 ./test-runner -p1 -l -Q
+```
+
+These are local protocol regressions. They do not replace real Kafka
+integration evidence for durable commits, broker fencing, transaction PID
+rollover, or end-to-end offset visibility.
+
+For required-TV2, a `CONCURRENT_TRANSACTIONS` OffsetCommit error is retryable
+only when a **fully parsed, correlated reply explicitly rejects every expected
+partition**, and the original absolute deadline has not elapsed. A mixed
+success/error reply, unverified callback error, ambiguous transport outcome,
+stale PID, or late acknowledgement must fail closed. The native `tv2_txnmgr`
+unit suite covers the positive and negative distinctions, but a pinned-broker
+test is still required to verify the asynchronous coordinator transition.
+
+Before a TV2 source change is accepted, exercise the normal shared and static
+`0000` suites, relevant mock tests, ASan/UBSan with leak checking, and GCC
+strict diagnostics against a fixed upstream baseline. TSan is useful when its
+runtime executes reliably; a sanitizer crash or skipped run is *not* a PASS.
+For real-broker acceptance use an owned disposable cluster and independent
+Java verification of the effective TV2 capability, 0/1/N outputs, abort,
+stable source offsets, terminal markers, exact key/value bytes, legacy mode,
+and (for rollover changes) a genuine PID/epoch boundary crossing. Record the
+exact library/fixture/broker identities, outcome, limitations and cleanup.
+
+Use a private build directory for isolated verification. Use `test.conf` or
+Trivup for real-broker tests, and run those tests only against a disposable,
+explicitly owned broker cluster. Tests requiring nonstandard broker setups
+(`1000`-`1999`) must be selected explicitly.
+
+Before merging, ensure new test cases fail for the original bug, pass with
+the fix, and can be re-run individually. Execute the applicable native unit,
+brokerless/mock, and broker-backed regression paths. Preserve pre-existing
+coverage during test migrations and report any scenarios not run. Future
+testing instructions belong here and in the repository's root `AGENTS.md`.
+
 
 ## Supported test environments
 

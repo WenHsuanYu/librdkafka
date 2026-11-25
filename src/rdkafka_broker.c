@@ -2640,6 +2640,25 @@ static void rd_kafka_broker_set_api_versions(rd_kafka_broker_t *rkb,
         /* Update feature set based on supported broker APIs. */
         rd_kafka_broker_features_set(
             rkb, rd_kafka_features_check(rkb, apis, api_cnt));
+
+        if (rkb->rkb_rk->rk_conf.eos.transaction_tv2_required &&
+            rkb->rkb_tv2_finalized) {
+                static const struct {
+                        int16_t key, version;
+                } required[] = {{RD_KAFKAP_InitProducerId, 4},
+                                {RD_KAFKAP_Produce, 12},
+                                {RD_KAFKAP_TxnOffsetCommit, 5},
+                                {RD_KAFKAP_EndTxn, 5}};
+                size_t i;
+                for (i = 0; i < RD_ARRAY_SIZE(required); i++) {
+                        if (rd_kafka_broker_ApiVersion_supported0(
+                                rkb, required[i].key, required[i].version,
+                                required[i].version, NULL, RD_DONT_LOCK) == -1) {
+                                rkb->rkb_tv2_finalized = rd_false;
+                                break;
+                        }
+                }
+        }
 }
 
 
@@ -2698,6 +2717,9 @@ static void rd_kafka_broker_handle_ApiVersion(rd_kafka_t *rk,
 
         if (err && apis)
                 rd_free(apis);
+
+        if (rk->rk_conf.eos.transaction_tv2_required)
+                retry_ApiVersion = -1;
 
         if (retry_ApiVersion != -1) {
                 /* Retry request with a lower version */
@@ -2762,8 +2784,11 @@ void rd_kafka_broker_connect_done(rd_kafka_broker_t *rkb, const char *errstr) {
 
         rd_kafka_broker_lock(rkb);
 
-        if (rkb->rkb_rk->rk_conf.api_version_request &&
-            rd_interval_immediate(&rkb->rkb_ApiVersion_fail_intvl, 0, 0) > 0) {
+        rkb->rkb_tv2_finalized = rd_false;
+        rkb->rkb_tv2_finalized_epoch = -1;
+        if (rkb->rkb_rk->rk_conf.eos.transaction_tv2_required ||
+            (rkb->rkb_rk->rk_conf.api_version_request &&
+             rd_interval_immediate(&rkb->rkb_ApiVersion_fail_intvl, 0, 0) > 0)) {
                 /* Use ApiVersion to query broker for supported API versions. */
                 rd_kafka_broker_feature_enable(rkb,
                                                RD_KAFKA_FEATURE_APIVERSION);
@@ -2814,15 +2839,45 @@ static RD_INLINE int rd_kafka_broker_request_supported(rd_kafka_broker_t *rkb,
         struct rd_kafka_ApiVersion skel = {.ApiKey =
                                                rkbuf->rkbuf_reqhdr.ApiKey};
         struct rd_kafka_ApiVersion *ret;
+        rd_bool_t tv2_request = rd_false;
 
         if (unlikely(rkbuf->rkbuf_reqhdr.ApiKey == RD_KAFKAP_ApiVersion))
                 return 1; /* ApiVersion requests are used to detect
                            * the supported API versions, so should always
                            * be allowed through. */
 
+        if (rkb->rkb_rk->rk_conf.eos.transaction_tv2_required) {
+                int16_t required = -1;
+                switch (skel.ApiKey) {
+                case RD_KAFKAP_InitProducerId:
+                        required = 4;
+                        break;
+                case RD_KAFKAP_Produce:
+                        required = 12;
+                        break;
+                case RD_KAFKAP_TxnOffsetCommit:
+                case RD_KAFKAP_EndTxn:
+                        required = 5;
+                        break;
+                case RD_KAFKAP_AddPartitionsToTxn:
+                case RD_KAFKAP_AddOffsetsToTxn:
+                        return 0;
+                }
+                if (required != -1) {
+                        if (!rkb->rkb_tv2_finalized ||
+                            rkbuf->rkbuf_reqhdr.ApiVersion != required)
+                                return 0;
+                        if (rd_kafka_fatal_error_code(rkb->rkb_rk) &&
+                            (rkbuf->rkbuf_corrid == 0 ||
+                             rkbuf->rkbuf_connid != rkb->rkb_connid))
+                                return 0;
+                        tv2_request = rd_true;
+                }
+        }
+
         /* First try feature flags, if any, which may cover a larger
          * set of APIs. */
-        if (rkbuf->rkbuf_features)
+        if (rkbuf->rkbuf_features && !tv2_request)
                 return (rkb->rkb_features & rkbuf->rkbuf_features) ==
                        rkbuf->rkbuf_features;
 
@@ -2843,6 +2898,19 @@ static RD_INLINE int rd_kafka_broker_request_supported(rd_kafka_broker_t *rkb,
  *
  * Locality: io thread
  */
+static int rd_kafka_tv2_offset_deadline_state(const rd_kafka_t *rk,
+                                              const rd_kafka_buf_t *rkbuf,
+                                              rd_ts_t now,
+                                              rd_bool_t previously_started) {
+        if (!rk->rk_conf.eos.transaction_tv2_required ||
+            rkbuf->rkbuf_reqhdr.ApiKey != RD_KAFKAP_TxnOffsetCommit ||
+            rkbuf->rkbuf_reqhdr.ApiVersion != 5 ||
+            !rkbuf->rkbuf_abs_timeout || now < rkbuf->rkbuf_abs_timeout)
+                return 0;
+
+        return previously_started ? 2 : 1;
+}
+
 int rd_kafka_send(rd_kafka_broker_t *rkb) {
         rd_kafka_buf_t *rkbuf;
         unsigned int cnt = 0;
@@ -2855,6 +2923,7 @@ int rd_kafka_send(rd_kafka_broker_t *rkb) {
                 ssize_t r;
                 size_t pre_of = rd_slice_offset(&rkbuf->rkbuf_reader);
                 rd_ts_t now;
+                rd_bool_t previously_started;
 
                 if (unlikely(rkbuf->rkbuf_flags & RD_KAFKA_OP_F_NEED_MAKE)) {
                         /* Request has not been created/baked yet,
@@ -2919,8 +2988,9 @@ int rd_kafka_send(rd_kafka_broker_t *rkb) {
                  * but need to use corrid to check this. SSL_write() expects
                  * us to send the same buffer again when 0 is returned.
                  */
-                if (rkbuf->rkbuf_corrid == 0 ||
-                    rkbuf->rkbuf_connid != rkb->rkb_connid) {
+                previously_started = rkbuf->rkbuf_corrid != 0 &&
+                                     rkbuf->rkbuf_connid == rkb->rkb_connid;
+                if (!previously_started) {
                         rd_assert(rd_slice_offset(&rkbuf->rkbuf_reader) == 0);
                         rkbuf->rkbuf_corrid = ++rkb->rkb_corrid;
                         rd_kafka_buf_update_i32(rkbuf, 4 + 2 + 2,
@@ -2940,6 +3010,30 @@ int rd_kafka_send(rd_kafka_broker_t *rkb) {
                             rd_kafka_ApiKey2str(rkbuf->rkbuf_reqhdr.ApiKey),
                             rkbuf->rkbuf_corrid, pre_of,
                             rd_slice_size(&rkbuf->rkbuf_reader));
+                }
+
+                /* Reject the first transport attempt at/after the absolute
+                 * TV2 mutation deadline, even when the ordinary broker
+                 * request timeout scanner has not run yet. A frame with a
+                 * previous CorrId on this connection may already have been
+                 * accepted by SSL_write() despite a zero-byte result: do
+                 * not drop its suffix while keeping the connection alive. */
+                switch (rd_kafka_tv2_offset_deadline_state(
+                    rkb->rkb_rk, rkbuf, rd_clock(), previously_started)) {
+                case 1:
+                        rd_kafka_bufq_deq(&rkb->rkb_outbufs, rkbuf);
+                        rd_kafka_buf_callback(rkb->rkb_rk, rkb,
+                                              RD_KAFKA_RESP_ERR__TIMED_OUT_QUEUE,
+                                              NULL, rkbuf);
+                        continue;
+                case 2:
+                        rd_kafka_broker_fail(
+                            rkb, LOG_WARNING, RD_KAFKA_RESP_ERR__TIMED_OUT,
+                            "Required TV2 offset mutation deadline expired "
+                            "during an in-progress request frame");
+                        return -1;
+                default:
+                        break;
                 }
 
                 if ((r = rd_kafka_broker_send(rkb, &rkbuf->rkbuf_reader)) == -1)
@@ -6972,11 +7066,49 @@ static int rd_ut_nodename_to_hostname(void) {
         RD_UT_PASS();
 }
 
+
 /**
  * @name Unit tests
  * @{
  *
  */
+static int rd_ut_tv2_offset_deadline(void) {
+        rd_kafka_t rk = {0};
+        rd_kafka_buf_t rkbuf = {0};
+        static const struct {
+                int16_t api_version;
+                rd_bool_t required;
+                rd_bool_t previously_started;
+                rd_ts_t now;
+                int expected;
+        } cases[] = {
+            {5, rd_true, rd_false, 99, 0},
+            {5, rd_true, rd_false, 100, 1},
+            {5, rd_true, rd_true, 100, 2},
+            {3, rd_true, rd_false, 101, 0},
+            {5, rd_false, rd_true, 101, 0},
+        };
+        size_t i;
+
+        rkbuf.rkbuf_reqhdr.ApiKey = RD_KAFKAP_TxnOffsetCommit;
+        rkbuf.rkbuf_abs_timeout   = 100;
+
+        for (i = 0; i < RD_ARRAY_SIZE(cases); i++) {
+                int actual;
+
+                rk.rk_conf.eos.transaction_tv2_required = cases[i].required;
+                rkbuf.rkbuf_reqhdr.ApiVersion = cases[i].api_version;
+                actual = rd_kafka_tv2_offset_deadline_state(
+                    &rk, &rkbuf, cases[i].now, cases[i].previously_started);
+                RD_UT_ASSERT(actual == cases[i].expected,
+                             "TV2 deadline admission case %" PRIusz
+                             ": expected %d, got %d",
+                             i, cases[i].expected, actual);
+        }
+
+        RD_UT_PASS();
+}
+
 int unittest_broker(void) {
         int fails = 0;
 
@@ -6984,6 +7116,7 @@ int unittest_broker(void) {
         fails += rd_ut_ApiVersion_at_least();
         fails += rd_ut_mk_nodename();
         fails += rd_ut_nodename_to_hostname();
+        fails += rd_ut_tv2_offset_deadline();
 
         return fails;
 }

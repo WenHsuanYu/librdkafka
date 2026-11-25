@@ -106,7 +106,7 @@ static RD_INLINE int
 rd_kafka_msgset_writer_select_MsgVersion(rd_kafka_msgset_writer_t *msetw) {
         rd_kafka_broker_t *rkb       = msetw->msetw_rkb;
         rd_kafka_toppar_t *rktp      = msetw->msetw_rktp;
-        const int16_t max_ApiVersion = rd_kafka_ProduceRequest_max_version;
+        int16_t max_ApiVersion = rd_kafka_ProduceRequest_max_version;
         int16_t min_ApiVersion       = 0;
         int feature;
         /* Map compression types to required feature and ApiVersion */
@@ -203,6 +203,10 @@ rd_kafka_msgset_writer_select_MsgVersion(rd_kafka_msgset_writer_t *msetw) {
         }
 
         /* Set the highest ApiVersion supported by us and broker */
+        if (rkb->rkb_rk->rk_conf.eos.transaction_tv2_required) {
+                min_ApiVersion = 12;
+                max_ApiVersion = 12;
+        }
         msetw->msetw_ApiVersion = rd_kafka_broker_ApiVersion_supported(
             rkb, RD_KAFKAP_Produce, min_ApiVersion, max_ApiVersion, NULL);
 
@@ -272,6 +276,8 @@ static void rd_kafka_msgset_writer_alloc_buf(rd_kafka_msgset_writer_t *msetw) {
          * ProduceRequest header sizes
          */
         switch (msetw->msetw_ApiVersion) {
+        case 12:
+        case 11:
         case 10:
         case 9:
         case 8:

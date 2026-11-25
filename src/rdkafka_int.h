@@ -652,6 +652,12 @@ struct rd_kafka_s {
 
                 /**< Transaction coordinator query timer */
                 rd_kafka_timer_t txn_coord_tmr;
+
+                /**< Required-TV2 offset staging deadline. All fields are
+                 * accessed on the rdkafka main thread. The timer owns no
+                 * callback request object. */
+                rd_kafka_timer_t txn_offset_commit_tmr;
+                rd_bool_t txn_offset_commit_active;
         } rk_eos;
 
         rd_atomic32_t rk_flushing; /**< Application is calling flush(). */

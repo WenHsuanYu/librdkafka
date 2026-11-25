@@ -53,6 +53,11 @@ void rd_qsort_r(void *base,
                 size_t size,
                 int (*compar)(const void *, const void *, void *),
                 void *arg) {
+        /* Empty lists may have a NULL base; qsort() requires a non-NULL
+         * pointer even though no comparisons would be performed. */
+        if (nmemb < 2)
+                return;
+
         rd_qsort_r_cmp = compar;
         rd_qsort_r_arg = arg;
         qsort(base, nmemb, size, rd_qsort_r_trampoline);

@@ -68,7 +68,11 @@ static RD_INLINE RD_UNUSED size_t rd_uvarint_enc_u64(char *dst,
 static RD_INLINE RD_UNUSED size_t rd_uvarint_enc_i64(char *dst,
                                                      size_t dstsize,
                                                      int64_t num) {
-        return rd_uvarint_enc_u64(dst, dstsize, (num << 1) ^ (num >> 63));
+        /* Convert before shifting: a signed left shift is undefined for
+         * negative values, including the common -1 zig-zag case. */
+        return rd_uvarint_enc_u64(
+            dst, dstsize,
+            ((uint64_t)num << 1) ^ (num < 0 ? UINT64_MAX : UINT64_C(0)));
 }
 
 

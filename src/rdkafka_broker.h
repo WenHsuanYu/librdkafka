@@ -208,6 +208,9 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
         struct rd_kafka_ApiVersion *rkb_ApiVersions; /* Broker's supported APIs
                                                       * (MUST be sorted) */
         size_t rkb_ApiVersions_cnt;
+        /* Finalized TV2 evidence for this connection (broker thread only). */
+        int64_t rkb_tv2_finalized_epoch;
+        rd_bool_t rkb_tv2_finalized;
         rd_interval_t rkb_ApiVersion_fail_intvl; /* Controls how long
                                                   * the fallback proto
                                                   * will be used after

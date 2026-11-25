@@ -159,6 +159,10 @@ New features and APIs should also result in an added test case.
 
 Submitted patches must pass all existing tests.
 For more information on the test suite see [tests/README.md].
+All new tests must use the native librdkafka test framework; see
+the "Native testing policy and execution" section of that guide.
+Internal-only unit regressions can use the existing `rd_kafka_unittest()`
+registry and `0000-unittests` instead of a new numbered test source file.
 
 
 

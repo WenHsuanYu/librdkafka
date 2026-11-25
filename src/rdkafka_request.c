@@ -593,10 +593,12 @@ err_parse:
  * @param coordkey is the group.id for RD_KAFKA_COORD_GROUP,
  *                 and the transactional.id for RD_KAFKA_COORD_TXN
  */
-rd_kafka_resp_err_t
-rd_kafka_FindCoordinatorRequest(rd_kafka_broker_t *rkb,
+static rd_kafka_resp_err_t
+rd_kafka_FindCoordinatorRequest0(rd_kafka_broker_t *rkb,
                                 rd_kafka_coordtype_t coordtype,
                                 const char *coordkey,
+                                rd_ts_t abs_timeout,
+                                rd_bool_t bounded,
                                 rd_kafka_replyq_t replyq,
                                 rd_kafka_resp_cb_t *resp_cb,
                                 void *opaque) {
@@ -619,9 +621,42 @@ rd_kafka_FindCoordinatorRequest(rd_kafka_broker_t *rkb,
 
         rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
+        if (bounded) {
+                if (abs_timeout <= rd_clock()) {
+                        rd_kafka_buf_destroy(rkbuf);
+                        return RD_KAFKA_RESP_ERR__TIMED_OUT;
+                }
+                rkbuf->rkbuf_rel_timeout = 0;
+                rkbuf->rkbuf_abs_timeout = abs_timeout;
+                rkbuf->rkbuf_force_timeout = rd_false;
+        }
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
 
         return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+rd_kafka_resp_err_t
+rd_kafka_FindCoordinatorRequest(rd_kafka_broker_t *rkb,
+                                rd_kafka_coordtype_t coordtype,
+                                const char *coordkey,
+                                rd_kafka_replyq_t replyq,
+                                rd_kafka_resp_cb_t *resp_cb,
+                                void *opaque) {
+        return rd_kafka_FindCoordinatorRequest0(
+            rkb, coordtype, coordkey, 0, rd_false, replyq, resp_cb, opaque);
+}
+
+rd_kafka_resp_err_t rd_kafka_FindCoordinatorRequest_abs(
+    rd_kafka_broker_t *rkb,
+    rd_kafka_coordtype_t coordtype,
+    const char *coordkey,
+    rd_ts_t abs_timeout,
+    rd_kafka_replyq_t replyq,
+    rd_kafka_resp_cb_t *resp_cb,
+    void *opaque) {
+        return rd_kafka_FindCoordinatorRequest0(
+            rkb, coordtype, coordkey, abs_timeout, rd_true, replyq, resp_cb,
+            opaque);
 }
 
 /**
@@ -3273,6 +3308,58 @@ rd_kafka_resp_err_t rd_kafka_MetadataRequest_resp_cb(
  *
  * @remark A valid \p apis might be returned even if an error is returned.
  */
+/* ApiVersions v3 response tags: finalized epoch (1), finalized features (2). */
+static int rd_kafka_tv2_feature_tag(rd_kafka_buf_t *rkbuf,
+                                    uint64_t tag,
+                                    uint64_t len,
+                                    int64_t *epoch,
+                                    rd_bool_t *tv2,
+                                    int64_t *last_tag) {
+        const int log_decode_errors = LOG_ERR;
+        rd_slice_t saved;
+        int32_t cnt;
+        rd_bool_t found = rd_false;
+
+        if (tag > INT32_MAX || (int64_t)tag <= *last_tag)
+                rd_kafka_buf_parse_fail(rkbuf, "Invalid feature tag order");
+        *last_tag = (int64_t)tag;
+        if (tag != 1 && tag != 2)
+                return 0;
+        if (len > rd_slice_remains(&rkbuf->rkbuf_reader) ||
+            !rd_slice_narrow_relative(&rkbuf->rkbuf_reader, &saved,
+                                      (size_t)len))
+                rd_kafka_buf_parse_fail(rkbuf, "Invalid finalized feature tag");
+
+        if (tag == 1) {
+                rd_kafka_buf_read_i64(rkbuf, epoch);
+        } else {
+                rd_kafka_buf_read_arraycnt(rkbuf, &cnt, 1000);
+                while (cnt-- > 0) {
+                        rd_kafkap_str_t name;
+                        int16_t max, min;
+                        rd_kafka_buf_read_str(rkbuf, &name);
+                        rd_kafka_buf_read_i16(rkbuf, &max);
+                        rd_kafka_buf_read_i16(rkbuf, &min);
+                        rd_kafka_buf_skip_tags(rkbuf);
+                        if (name.len == 19 && name.str &&
+                            !memcmp(name.str, "transaction.version", 19)) {
+                                if (found)
+                                        rd_kafka_buf_parse_fail(
+                                            rkbuf, "Duplicate transaction feature");
+                                found = rd_true;
+                                *tv2 = min == 2 && max == 2;
+                        }
+                }
+        }
+        if (rd_slice_remains(&rkbuf->rkbuf_reader))
+                rd_kafka_buf_parse_fail(rkbuf, "Invalid feature tag size");
+        rd_slice_widen(&rkbuf->rkbuf_reader, &saved);
+        return 1;
+
+err_parse:
+        return -1;
+}
+
 rd_kafka_resp_err_t
 rd_kafka_handle_ApiVersion(rd_kafka_t *rk,
                            rd_kafka_broker_t *rkb,
@@ -3285,6 +3372,9 @@ rd_kafka_handle_ApiVersion(rd_kafka_t *rk,
         int32_t ApiArrayCnt;
         int16_t ErrorCode;
         int i = 0;
+        int64_t finalized_epoch = -1;
+        int64_t last_tag = -1;
+        rd_bool_t tv2 = rd_false;
 
         *apis    = NULL;
         *api_cnt = 0;
@@ -3325,8 +3415,17 @@ rd_kafka_handle_ApiVersion(rd_kafka_t *rk,
         if (request->rkbuf_reqhdr.ApiVersion >= 1)
                 rd_kafka_buf_read_throttle_time(rkbuf);
 
-        /* Discard end tags */
-        rd_kafka_buf_skip_tags(rkbuf);
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                rd_kafka_buf_read_tags(rkbuf, rd_kafka_tv2_feature_tag,
+                                       &finalized_epoch, &tv2, &last_tag);
+                if (rd_slice_remains(&rkbuf->rkbuf_reader))
+                        rd_kafka_buf_parse_fail(rkbuf, "Unexpected feature data");
+                rkb->rkb_tv2_finalized_epoch = finalized_epoch;
+                rkb->rkb_tv2_finalized = !err && tv2 && finalized_epoch >= 0;
+        } else {
+                /* Discard end tags */
+                rd_kafka_buf_skip_tags(rkbuf);
+        }
 
         *api_cnt = ApiArrayCnt;
         qsort(*apis, *api_cnt, sizeof(**apis), rd_kafka_ApiVersion_key_cmp);
@@ -3983,6 +4082,11 @@ rd_kafka_handle_Produce_parse(rd_kafka_broker_t *rkb,
                 goto err;
 
         rd_kafka_buf_read_i32(rkbuf, &hdr.Partition);
+        if (rkb->rkb_rk->rk_conf.eos.transaction_tv2_required &&
+            (TopicName.len <= 0 || !TopicName.str ||
+             rd_kafkap_str_cmp(&TopicName, rktp->rktp_rkt->rkt_topic) ||
+             hdr.Partition != rktp->rktp_partition))
+                goto err;
         rd_kafka_buf_read_i16(rkbuf, &hdr.ErrorCode);
         rd_kafka_buf_read_i64(rkbuf, &hdr.Offset);
 
@@ -4006,6 +4110,10 @@ rd_kafka_handle_Produce_parse(rd_kafka_broker_t *rkb,
                         rd_kafka_buf_parse_fail(
                             rkbuf, "RecordErrorsCnt %" PRId32 " out of range",
                             RecordErrorsCnt);
+                if (rkb->rkb_rk->rk_conf.eos.transaction_tv2_required &&
+                    (size_t)RecordErrorsCnt >
+                        rd_slice_remains(&rkbuf->rkbuf_reader) / 6)
+                        goto err;
                 if (RecordErrorsCnt) {
                         rd_kafka_Produce_result_record_error_t *record_errors =
                             rd_calloc(RecordErrorsCnt, sizeof(*record_errors));
@@ -4071,6 +4179,10 @@ rd_kafka_handle_Produce_parse(rd_kafka_broker_t *rkb,
         /* ProduceResponse tags */
         rd_kafka_buf_read_tags(rkbuf, rd_kafkap_Produce_reply_tags_parse,
                                &ProduceTags);
+
+        if (rkb->rkb_rk->rk_conf.eos.transaction_tv2_required &&
+            rd_slice_remains(&rkbuf->rkbuf_reader))
+                goto err;
 
         rd_kafka_handle_Produce_metadata_update(rkb, &ProduceTags);
 
@@ -4482,6 +4594,20 @@ static int rd_kafka_handle_Produce_error(rd_kafka_broker_t *rkb,
 
         if (unlikely(perr->err == RD_KAFKA_RESP_ERR__DESTROY))
                 return 0; /* Terminating */
+
+        if (rk->rk_conf.eos.transaction_tv2_required &&
+            (perr->err == RD_KAFKA_RESP_ERR__BAD_MSG ||
+             perr->err == RD_KAFKA_RESP_ERR__UNDERFLOW)) {
+                /* The broker may already have appended the records. */
+                rd_kafka_txn_set_fatal_error(
+                    rk, RD_DO_LOCK, perr->err,
+                    "TV2 Produce response is incomplete or uncorrelated");
+                perr->actions = RD_KAFKA_ERR_ACTION_PERMANENT;
+                perr->status = RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED;
+                perr->update_next_ack = rd_false;
+                perr->update_next_err = rd_true;
+                return 1;
+        }
 
         /* When there is a partition leader change any outstanding
          * requests to the old broker will be handled by the old
@@ -5076,6 +5202,14 @@ static void rd_kafka_handle_Produce(rd_kafka_t *rk,
         if (!err && reply)
                 err = rd_kafka_handle_Produce_parse(rkb, rktp, reply, request,
                                                     result);
+
+        if (rk->rk_conf.eos.transaction_tv2_required &&
+            (err == RD_KAFKA_RESP_ERR__BAD_MSG ||
+             err == RD_KAFKA_RESP_ERR__UNDERFLOW)) {
+                rd_kafka_Produce_result_destroy(result);
+                result = rd_kafka_Produce_result_new(RD_KAFKA_OFFSET_INVALID,
+                                                     -1);
+        }
 
         rd_kafka_msgbatch_handle_Produce_result(rkb, batch, err, result,
                                                 request);
@@ -6427,6 +6561,14 @@ void rd_kafka_handle_InitProducerId(rd_kafka_t *rk,
         rd_kafka_buf_read_i64(rkbuf, &pid.id);
         rd_kafka_buf_read_i16(rkbuf, &pid.epoch);
 
+        if (rk->rk_conf.eos.transaction_tv2_required) {
+                rd_kafka_buf_skip_tags(rkbuf);
+                if (pid.id < 0 || pid.epoch < 0 ||
+                    rd_slice_remains(&rkbuf->rkbuf_reader)) {
+                        err = RD_KAFKA_RESP_ERR__BAD_MSG;
+                        goto err;
+                }
+        }
         rd_kafka_idemp_pid_update(rkb, pid);
 
         return;
@@ -6470,7 +6612,22 @@ rd_kafka_InitProducerIdRequest(rd_kafka_broker_t *rkb,
         rd_kafka_buf_t *rkbuf;
         int16_t ApiVersion;
 
-        if (current_pid) {
+        if (rkb->rkb_rk->rk_conf.eos.transaction_tv2_required) {
+                if (current_pid) {
+                        rd_snprintf(errstr, errstr_size,
+                                    "TV2 identity reinitialization is forbidden");
+                        rd_kafka_replyq_destroy(&replyq);
+                        return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+                }
+                ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                    rkb, RD_KAFKAP_InitProducerId, 4, 4, NULL);
+                if (ApiVersion == -1) {
+                        rd_snprintf(errstr, errstr_size,
+                                    "Required InitProducerId v4 unavailable");
+                        rd_kafka_replyq_destroy(&replyq);
+                        return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+                }
+        } else if (current_pid) {
                 ApiVersion = rd_kafka_broker_ApiVersion_supported(
                     rkb, RD_KAFKAP_InitProducerId, 3, 4, NULL);
                 if (ApiVersion == -1) {
@@ -6700,8 +6857,12 @@ rd_kafka_resp_err_t rd_kafka_EndTxnRequest(rd_kafka_broker_t *rkb,
         rd_kafka_buf_t *rkbuf;
         int16_t ApiVersion = 0;
 
-        ApiVersion = rd_kafka_broker_ApiVersion_supported(rkb, RD_KAFKAP_EndTxn,
-                                                          0, 1, NULL);
+        if (rkb->rkb_rk->rk_conf.eos.transaction_tv2_required)
+                ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                    rkb, RD_KAFKAP_EndTxn, 5, 5, NULL);
+        else
+                ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                    rkb, RD_KAFKAP_EndTxn, 0, 1, NULL);
         if (ApiVersion == -1) {
                 rd_snprintf(errstr, errstr_size,
                             "EndTxnRequest (KIP-98) not supported "
@@ -6710,7 +6871,8 @@ rd_kafka_resp_err_t rd_kafka_EndTxnRequest(rd_kafka_broker_t *rkb,
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         }
 
-        rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_EndTxn, 1, 500);
+        rkbuf = rd_kafka_buf_new_flexver_request(
+            rkb, RD_KAFKAP_EndTxn, 1, 500, ApiVersion >= 3);
 
         /* transactional_id */
         rd_kafka_buf_write_str(rkbuf, transactional_id, -1);
@@ -6722,10 +6884,13 @@ rd_kafka_resp_err_t rd_kafka_EndTxnRequest(rd_kafka_broker_t *rkb,
         /* Committed */
         rd_kafka_buf_write_bool(rkbuf, committed);
         rkbuf->rkbuf_u.EndTxn.commit = committed;
+        rkbuf->rkbuf_u.EndTxn.pid = pid;
 
         rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
-        rkbuf->rkbuf_max_retries = RD_KAFKA_REQUEST_MAX_RETRIES;
+        rkbuf->rkbuf_max_retries = ApiVersion == 5
+                                      ? RD_KAFKA_REQUEST_NO_RETRIES
+                                      : RD_KAFKA_REQUEST_MAX_RETRIES;
 
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
 
@@ -7340,6 +7505,404 @@ static int unittest_handle_GetTelemetrySubscriptions(void) {
         return 0;
 }
 
+/* Required-TV2 protocol regressions use the native internal unit runner. */
+enum unittest_tv2_reply_kind {
+        TV2_REPLY_NORMAL,
+        TV2_REPLY_TRAILING,
+        TV2_REPLY_TRUNCATED,
+        TV2_REPLY_NULL_ERRORS,
+        TV2_REPLY_EXTRA_RECORD_ERRORS
+};
+
+static rd_kafka_buf_t *unittest_tv2_Produce_reply(
+    rd_kafka_broker_t *rkb,
+    const char *topic,
+    int32_t partition,
+    enum unittest_tv2_reply_kind kind) {
+        rd_kafka_buf_t *reply =
+            rd_kafka_buf_new0(1, 128, RD_KAFKA_OP_F_FLEXVER);
+
+        rd_kafka_broker_keep(rkb);
+        reply->rkbuf_rkb = rkb;
+        rd_kafka_buf_write_arraycnt(reply, 1);
+        rd_kafka_buf_write_str(reply, topic, topic ? strlen(topic) : 0);
+        rd_kafka_buf_write_arraycnt(reply, 1);
+        rd_kafka_buf_write_i32(reply, partition);
+        rd_kafka_buf_write_i16(reply, 0);
+        rd_kafka_buf_write_i64(reply, 42);
+        rd_kafka_buf_write_i64(reply, -1);
+        rd_kafka_buf_write_i64(reply, 0);
+        if (kind == TV2_REPLY_NULL_ERRORS)
+                rd_kafka_buf_write_uvarint(reply, 0);
+        else if (kind == TV2_REPLY_EXTRA_RECORD_ERRORS) {
+                rd_kafka_buf_write_arraycnt(reply, 1);
+                rd_kafka_buf_write_i32(reply, 0);
+                rd_kafka_buf_write_str(reply, NULL, 0);
+                rd_kafka_buf_write_tags_empty(reply);
+        }
+        else
+                rd_kafka_buf_write_arraycnt(reply, 0);
+        rd_kafka_buf_write_str(reply, NULL, 0);
+        rd_kafka_buf_write_tags_empty(reply);
+        rd_kafka_buf_write_tags_empty(reply);
+        rd_kafka_buf_write_i32(reply, 0);
+        if (kind != TV2_REPLY_TRUNCATED)
+                rd_kafka_buf_write_tags_empty(reply);
+        if (kind == TV2_REPLY_TRAILING)
+                rd_kafka_buf_write_i8(reply, 0);
+        rd_slice_init_full(&reply->rkbuf_reader, &reply->rkbuf_buf);
+        return reply;
+}
+
+/**
+ * Verify the response identity and complete decoding for a single-partition
+ * TV2 Produce request through the existing request unit-test suite.
+ */
+static int unittest_tv2_Produce_response(void) {
+        rd_kafka_conf_t *conf = rd_kafka_conf_new();
+        rd_kafka_t *rk;
+        rd_kafka_broker_t *rkb;
+        rd_kafka_toppar_t *rktp;
+        rd_kafka_buf_t *request;
+        int fails = 0;
+        int i;
+        static const struct {
+                const char *topic;
+                int32_t partition;
+                enum unittest_tv2_reply_kind kind;
+                rd_kafka_resp_err_t expected;
+        } cases[] = {
+            {"uttopic", 0, TV2_REPLY_NORMAL, RD_KAFKA_RESP_ERR_NO_ERROR},
+            {"other", 0, TV2_REPLY_NORMAL, RD_KAFKA_RESP_ERR__BAD_MSG},
+            {"uttopic", 1, TV2_REPLY_NORMAL, RD_KAFKA_RESP_ERR__BAD_MSG},
+            {"uttopic", 0, TV2_REPLY_TRAILING, RD_KAFKA_RESP_ERR__BAD_MSG},
+            {NULL, 0, TV2_REPLY_NORMAL, RD_KAFKA_RESP_ERR__BAD_MSG},
+            {"", 0, TV2_REPLY_NORMAL, RD_KAFKA_RESP_ERR__BAD_MSG},
+            {"uttopic", 0, TV2_REPLY_TRUNCATED, RD_KAFKA_RESP_ERR__UNDERFLOW},
+            {"uttopic", 0, TV2_REPLY_NULL_ERRORS, RD_KAFKA_RESP_ERR__BAD_MSG},
+            {"uttopic", 0, TV2_REPLY_EXTRA_RECORD_ERRORS,
+             RD_KAFKA_RESP_ERR__BAD_MSG},
+        };
+
+        if (rd_kafka_conf_set(conf, "transactional.id", "unit-tv2", NULL, 0) !=
+                RD_KAFKA_CONF_OK ||
+            rd_kafka_conf_set(conf, "transaction.tv2.required", "true", NULL,
+                              0) != RD_KAFKA_CONF_OK) {
+                rd_kafka_conf_destroy(conf);
+                return 1;
+        }
+        rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, NULL, 0);
+        if (!rk) {
+                rd_kafka_conf_destroy(conf);
+                return 1;
+        }
+        rkb = rd_kafka_broker_add_logical(rk, "unittest");
+        rktp = rd_kafka_toppar_get2(rk, "uttopic", 0, rd_false, rd_true);
+        if (!rktp) {
+                rd_kafka_broker_destroy(rkb);
+                rd_kafka_destroy(rk);
+                return 1;
+        }
+        request = rd_kafka_buf_new(0, 0);
+        request->rkbuf_reqhdr.ApiVersion = 12;
+
+        for (i = 0; i < (int)RD_ARRAY_SIZE(cases); i++) {
+                rd_kafka_buf_t *reply = unittest_tv2_Produce_reply(
+                    rkb, cases[i].topic, cases[i].partition, cases[i].kind);
+                rd_kafka_Produce_result_t *result =
+                    rd_kafka_Produce_result_new(RD_KAFKA_OFFSET_INVALID, -1);
+                rd_kafka_resp_err_t err;
+
+                err = rd_kafka_handle_Produce_parse(
+                    rkb, rktp, reply, request, result);
+                if (err != cases[i].expected ||
+                    (!err && result->offset != 42)) {
+                        fprintf(stderr,
+                                "TV2 Produce response case %d: expected %d, "
+                                "got %d, offset %" PRId64 "\n",
+                                i, cases[i].expected, err, result->offset);
+                        fails++;
+                }
+                rd_kafka_Produce_result_destroy(result);
+                rd_kafka_buf_destroy(reply);
+        }
+        rd_kafka_buf_destroy(request);
+        rd_kafka_toppar_destroy0(__func__, __LINE__, rktp);
+        rd_kafka_broker_destroy(rkb);
+        rd_kafka_destroy(rk);
+        return fails;
+}
+
+/** A malformed acknowledgement must poison the handle and fail delivery. */
+static int unittest_tv2_Produce_callback(enum unittest_tv2_reply_kind kind,
+                                          rd_kafka_resp_err_t expected) {
+        rd_kafka_conf_t *conf = rd_kafka_conf_new();
+        rd_kafka_t *rk;
+        rd_kafka_broker_t *rkb;
+        rd_kafka_toppar_t *rktp;
+        rd_kafka_queue_t *queue;
+        rd_kafka_buf_t *request, *reply;
+        rd_kafka_msgbatch_t *batch;
+        rd_kafka_pid_t pid = {.id = 1000, .epoch = 0};
+        rd_kafka_event_t *event;
+        int fails = 0, deliveries = 0;
+        rd_ts_t deadline;
+        char fatal_message[512];
+
+        if (rd_kafka_conf_set(conf, "transactional.id", "unit-tv2-callback",
+                              NULL, 0) != RD_KAFKA_CONF_OK ||
+            rd_kafka_conf_set(conf, "transaction.tv2.required", "true", NULL,
+                              0) != RD_KAFKA_CONF_OK) {
+                rd_kafka_conf_destroy(conf);
+                return 1;
+        }
+        rd_kafka_conf_set_events(conf, RD_KAFKA_EVENT_DR);
+        rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, NULL, 0);
+        if (!rk) {
+                rd_kafka_conf_destroy(conf);
+                return 1;
+        }
+        rkb = rd_kafka_broker_add_logical(rk, "unittest");
+        rktp = rd_kafka_toppar_get2(rk, "uttopic", 0, rd_false, rd_true);
+        if (!rktp) {
+                rd_kafka_broker_destroy(rkb);
+                rd_kafka_destroy(rk);
+                return 1;
+        }
+        queue = rd_kafka_queue_get_main(rk);
+
+        /* Model a previously initialized transaction, without any network I/O. */
+        rd_kafka_wrlock(rk);
+        rk->rk_eos.txn_state = RD_KAFKA_TXN_STATE_WAIT_PID;
+        rd_kafka_idemp_set_state(rk, RD_KAFKA_IDEMP_STATE_WAIT_PID);
+        rd_kafka_wrunlock(rk);
+        rd_kafka_idemp_pid_update(rkb, pid);
+        rd_kafka_wrlock(rk);
+        rk->rk_eos.txn_state = RD_KAFKA_TXN_STATE_IN_TRANSACTION;
+        rd_atomic32_set(&rk->rk_eos.txn_may_enq, 1);
+        rd_kafka_wrunlock(rk);
+        rd_kafka_toppar_pid_change(rktp, pid, 1);
+
+        request = rd_kafka_buf_new(0, 0);
+        request->rkbuf_reqhdr.ApiKey = RD_KAFKAP_Produce;
+        request->rkbuf_reqhdr.ApiVersion = 12;
+        batch = &request->rkbuf_batch;
+        rd_kafka_msgbatch_init(batch, rktp, pid, 1);
+        ut_create_msgs(&batch->msgq, 1, 1);
+        rd_kafka_msgbatch_set_first_msg(batch, rd_kafka_msgq_first(&batch->msgq));
+        rd_kafka_msgbatch_ready_produce(batch);
+        reply = unittest_tv2_Produce_reply(rkb, "uttopic", 0, kind);
+        rd_kafka_handle_Produce(
+            rk, rkb, RD_KAFKA_RESP_ERR_NO_ERROR, reply, request, NULL);
+
+        if (rd_kafka_fatal_error(rk, fatal_message, sizeof(fatal_message)) !=
+            expected)
+                fails++;
+        rd_kafka_rdlock(rk);
+        if (rk->rk_eos.txn_state != RD_KAFKA_TXN_STATE_FATAL_ERROR ||
+            rd_atomic32_get(&rk->rk_eos.txn_may_enq))
+                fails++;
+        rd_kafka_rdunlock(rk);
+        rd_kafka_toppar_lock(rktp);
+        if (rktp->rktp_eos.next_ack_seq != 0 ||
+            rd_kafka_msgq_len(&rktp->rktp_msgq) ||
+            rd_kafka_msgq_len(&rktp->rktp_xmit_msgq))
+                fails++;
+        rd_kafka_toppar_unlock(rktp);
+        if (rd_kafka_msgq_len(&batch->msgq) ||
+            rd_atomic32_get(&rktp->rktp_msgs_inflight) ||
+            rd_atomic32_get(&rk->rk_eos.inflight_toppar_cnt) ||
+            rd_atomic64_get(&rk->rk_eos.txn_dr_fails) != 1)
+                fails++;
+
+        deadline = rd_timeout_init(1000);
+        while (!rd_timeout_expired(rd_timeout_remains(deadline))) {
+                event = rd_kafka_queue_poll(queue, 10);
+                if (!event)
+                        continue;
+                if (rd_kafka_event_type(event) == RD_KAFKA_EVENT_DR) {
+                        const rd_kafka_message_t *message;
+                        while ((message = rd_kafka_event_message_next(event))) {
+                                deliveries++;
+                                if (message->err != expected ||
+                                    rd_kafka_message_status(message) !=
+                                        RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED ||
+                                    message->offset != RD_KAFKA_OFFSET_INVALID)
+                                        fails++;
+                        }
+                }
+                rd_kafka_event_destroy(event);
+                if (deliveries)
+                        break;
+        }
+        if (deliveries != 1)
+                fails++;
+        if (fails)
+                fprintf(stderr, "TV2 Produce callback kind %d failures: %d\n",
+                        kind, fails);
+        rd_kafka_buf_destroy(reply);
+        rd_kafka_buf_destroy(request);
+        rd_kafka_queue_destroy(queue);
+        rd_kafka_toppar_destroy0(__func__, __LINE__, rktp);
+        rd_kafka_broker_destroy(rkb);
+        rd_kafka_destroy(rk);
+        return fails;
+}
+
+/** Verify signed big-endian values without using the integer writers. */
+static int unittest_signed_wire_readers(void) {
+        static const unsigned char wire[] = {
+            0xff, 0xff, 0x80, 0x00, 0x7f, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00,
+            0x7f, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff};
+        static const int16_t expected16[] = {-1, INT16_MIN, INT16_MAX};
+        static const int32_t expected32[] = {-1, INT32_MIN, INT32_MAX};
+        static const int64_t expected64[] = {-1, INT64_MIN, INT64_MAX};
+        rd_kafka_buf_t *rkbuf = rd_kafka_buf_new_shadow(wire, sizeof(wire), NULL);
+        const int log_decode_errors = 0;
+        int16_t v16;
+        int32_t v32;
+        int64_t v64;
+        int scalar;
+        size_t i;
+        int fails = 0;
+        rd_bool_t expect_underflow = rd_false;
+
+        for (i = 0; i < RD_ARRAY_SIZE(expected16); i++) {
+                rd_kafka_buf_read_i16(rkbuf, &v16);
+                if (v16 != expected16[i])
+                        fails++;
+        }
+        for (i = 0; i < RD_ARRAY_SIZE(expected32); i++) {
+                rd_kafka_buf_read_i32(rkbuf, &v32);
+                if (v32 != expected32[i])
+                        fails++;
+        }
+        for (i = 0; i < RD_ARRAY_SIZE(expected64); i++) {
+                rd_kafka_buf_read_i64(rkbuf, &v64);
+                if (v64 != expected64[i])
+                        fails++;
+        }
+        rd_kafka_buf_read_i16a(rkbuf, scalar);
+        if (scalar != -1 || rd_slice_remains(&rkbuf->rkbuf_reader))
+                fails++;
+        expect_underflow = rd_true;
+        rd_kafka_buf_read_i64(rkbuf, &v64);
+        fails++; /* No bytes remain: the read must not succeed. */
+        goto done;
+
+err_parse:
+        if (!expect_underflow || rkbuf->rkbuf_err != RD_KAFKA_RESP_ERR__UNDERFLOW)
+                fails++;
+done:
+        if (fails)
+                fprintf(stderr, "Signed wire reader failures: %d\n", fails);
+        rd_kafka_buf_destroy(rkbuf);
+        return fails;
+}
+
+static rd_kafka_resp_err_t unittest_read_wire_string(rd_kafka_buf_t *rkbuf,
+                                                    rd_kafkap_str_t *str) {
+        const int log_decode_errors = 0;
+        rd_kafka_buf_read_str(rkbuf, str);
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+err_parse:
+        return rkbuf->rkbuf_err;
+}
+
+/** Verify standard and compact string sentinels and malformed lengths. */
+static int unittest_wire_strings(void) {
+        static const struct {
+                unsigned char wire[8];
+                size_t size;
+                int flags;
+                int len;
+                rd_kafka_resp_err_t expected;
+        } cases[] = {
+            {{0xff, 0xff}, 2, 0, -1, RD_KAFKA_RESP_ERR_NO_ERROR},
+            {{0x00, 0x00}, 2, 0, 0, RD_KAFKA_RESP_ERR_NO_ERROR},
+            {{0x00, 0x02, 'a', 'b'}, 4, 0, 2, RD_KAFKA_RESP_ERR_NO_ERROR},
+            {{0xff, 0xfe}, 2, 0, 0, RD_KAFKA_RESP_ERR__UNDERFLOW},
+            {{0x00, 0x02, 'a'}, 3, 0, 0, RD_KAFKA_RESP_ERR__UNDERFLOW},
+            {{0}, 1, RD_KAFKA_OP_F_FLEXVER, -1, RD_KAFKA_RESP_ERR_NO_ERROR},
+            {{1}, 1, RD_KAFKA_OP_F_FLEXVER, 0, RD_KAFKA_RESP_ERR_NO_ERROR},
+            {{3, 'a', 'b'}, 3, RD_KAFKA_OP_F_FLEXVER, 2,
+             RD_KAFKA_RESP_ERR_NO_ERROR},
+            {{3, 'a'}, 2, RD_KAFKA_OP_F_FLEXVER, 0,
+             RD_KAFKA_RESP_ERR__UNDERFLOW},
+            {{0x81, 0x80, 0x80, 0x80, 0x10}, 5, RD_KAFKA_OP_F_FLEXVER, 0,
+             RD_KAFKA_RESP_ERR__BAD_MSG},
+        };
+        size_t i;
+        int fails = 0;
+
+        for (i = 0; i < RD_ARRAY_SIZE(cases); i++) {
+                rd_kafka_buf_t *rkbuf = rd_kafka_buf_new_shadow(
+                    cases[i].wire, cases[i].size, NULL);
+                rd_kafkap_str_t str = {0};
+                rd_kafka_resp_err_t err;
+
+                rkbuf->rkbuf_flags = cases[i].flags;
+                err = unittest_read_wire_string(rkbuf, &str);
+                if (err != cases[i].expected ||
+                    (!err && (str.len != cases[i].len ||
+                              (str.len == -1 && str.str != NULL) ||
+                              (str.len == 0 && (!str.str || *str.str)) ||
+                              (str.len == 2 &&
+                               (!str.str || memcmp(str.str, "ab", 2))) ||
+                              rd_slice_remains(&rkbuf->rkbuf_reader)))) {
+                        fprintf(stderr,
+                                "Wire string case %" PRIusz
+                                ": expected %d, got %d, length %d\n",
+                                i, cases[i].expected, err, str.len);
+                        fails++;
+                }
+                rd_kafka_buf_destroy(rkbuf);
+        }
+        return fails;
+}
+
+
+/** Run the dedicated TV2 wire regression cases through the native harness. */
+static int rd_ut_tv2_Produce_response(void) {
+        int fails = unittest_tv2_Produce_response();
+        RD_UT_ASSERT(fails == 0, "TV2 Produce response: %d failures", fails);
+        RD_UT_PASS();
+}
+
+static int rd_ut_tv2_Produce_callback_trailing(void) {
+        int fails = unittest_tv2_Produce_callback(
+            TV2_REPLY_TRAILING, RD_KAFKA_RESP_ERR__BAD_MSG);
+        RD_UT_ASSERT(fails == 0, "TV2 Produce trailing bytes: %d failures",
+                     fails);
+        RD_UT_PASS();
+}
+
+static int rd_ut_tv2_Produce_callback_truncated(void) {
+        int fails = unittest_tv2_Produce_callback(
+            TV2_REPLY_TRUNCATED, RD_KAFKA_RESP_ERR__UNDERFLOW);
+        RD_UT_ASSERT(fails == 0, "TV2 Produce truncated reply: %d failures",
+                     fails);
+        RD_UT_PASS();
+}
+
+static int rd_ut_tv2_signed_wire_readers(void) {
+        int fails = unittest_signed_wire_readers();
+        RD_UT_ASSERT(fails == 0, "Signed wire readers: %d failures", fails);
+        RD_UT_PASS();
+}
+
+static int rd_ut_tv2_wire_strings(void) {
+        int fails = unittest_wire_strings();
+        RD_UT_ASSERT(fails == 0, "Wire string sentinels: %d failures", fails);
+        RD_UT_PASS();
+}
+
+
 /**
  * @brief Test that GetTelemetrySubscriptions response handling rejects
  *        an out-of-range AcceptedCompressionTypes array count (a nullable
@@ -7500,6 +8063,11 @@ int unittest_request(void) {
         fails += unittest_idempotent_producer();
         fails += unittest_handle_Produce_record_errors();
         fails += unittest_handle_GetTelemetrySubscriptions();
+        fails += rd_ut_tv2_Produce_response();
+        fails += rd_ut_tv2_Produce_callback_trailing();
+        fails += rd_ut_tv2_Produce_callback_truncated();
+        fails += rd_ut_tv2_signed_wire_readers();
+        fails += rd_ut_tv2_wire_strings();
         fails += unittest_handle_GetTelemetrySubscriptions_bad_arraycnt();
 
         return fails;

@@ -218,7 +218,8 @@ static uint32_t ut_calc_msgset_crc(const char *buf,
  * @returns number of bytes written
  */
 static size_t ut_write_varint(char *buf, int64_t value) {
-        uint64_t uval = (value << 1) ^ (value >> 63); /* Zigzag encoding */
+        uint64_t uval = ((uint64_t)value << 1) ^
+                        (value < 0 ? UINT64_MAX : UINT64_C(0));
         size_t i      = 0;
 
         while (uval >= 0x80) {

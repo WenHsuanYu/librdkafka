@@ -129,6 +129,12 @@ int unittest_rdvarint(void) {
         fails += do_test_rd_uvarint_enc_i64(
             __FILE__, __LINE__, -1234567890101112,
             (const char[]) {0xef, 0x8d, 0xd3, 0xc8, 0xa7, 0xb5, 0xb1, 0x04}, 8);
+        fails += do_test_rd_uvarint_enc_i64(
+            __FILE__, __LINE__, INT64_MIN,
+            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01", 10);
+        fails += do_test_rd_uvarint_enc_i64(
+            __FILE__, __LINE__, INT64_MAX,
+            "\xfe\xff\xff\xff\xff\xff\xff\xff\xff\x01", 10);
 
         return fails;
 }

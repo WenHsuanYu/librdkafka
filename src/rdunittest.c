@@ -418,6 +418,8 @@ static int unittest_rdclock(void) {
 extern int unittest_string(void);
 extern int unittest_cgrp(void);
 extern int unittest_mock_cluster(void);
+extern int unittest_txnmgr_tv2(void);
+extern int unittest_rdkafka_buf_ranges(void);
 #if WITH_SASL_SCRAM
 extern int unittest_scram(void);
 #endif
@@ -452,6 +454,7 @@ int rd_unittest(void) {
             {"string", unittest_string},
             {"map", unittest_map},
             {"rdbuf", unittest_rdbuf},
+            {"rdbuf_ranges", unittest_rdkafka_buf_ranges},
             {"rdvarint", unittest_rdvarint},
             {"crc32c", unittest_rd_crc32c},
             {"msg", unittest_msg},
@@ -467,6 +470,7 @@ int rd_unittest(void) {
             {"conf", unittest_conf},
             {"broker", unittest_broker},
             {"request", unittest_request},
+            {"tv2_txnmgr", unittest_txnmgr_tv2},
 #if WITH_SASL_OAUTHBEARER
             {"sasl_oauthbearer", unittest_sasl_oauthbearer},
 #endif

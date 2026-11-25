@@ -961,7 +961,7 @@ rd_slice_peek(const rd_slice_t *slice, size_t offset, void *dst, size_t size) {
  *        storing the decoded number in \p nump on success (return value > 0).
  *
  * @returns the number of bytes read on success or 0 in case of
- *          buffer underflow.
+ *          buffer underflow or integer overflow.
  */
 size_t rd_slice_read_uvarint(rd_slice_t *slice, uint64_t *nump) {
         uint64_t num = 0;
@@ -979,6 +979,11 @@ size_t rd_slice_read_uvarint(rd_slice_t *slice, uint64_t *nump) {
                                 return 0; /* Underflow */
 
                         oct = *(const unsigned char *)(seg->seg_p + rof);
+
+                        /* The tenth byte has only one available value bit
+                         * and must terminate the uint64_t encoding. */
+                        if (unlikely(shift == 63 && oct > 1))
+                                return 0;
 
                         num |= (uint64_t)(oct & 0x7f) << shift;
                         shift += 7;

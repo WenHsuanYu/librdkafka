@@ -83,6 +83,8 @@ typedef struct rd_kafka_coord_req_s {
                                          *   provided to creq_send_req_cb
                                          *   (optional). */
         rd_kafka_timer_t creq_tmr;      /**< Delay timer. */
+        rd_kafka_timer_t creq_deadline_tmr; /**< Bounded discovery timer. */
+        rd_bool_t creq_bounded; /**< Immutable: absolute deadline variant. */
         rd_ts_t creq_ts_timeout;        /**< Absolute timeout.
                                          *   Will fail with an error
                                          *   code pertaining to the
@@ -107,6 +109,8 @@ typedef struct rd_kafka_coord_req_s {
                               *   destroying the creq even
                               *   with outstanding
                               *   FindCoordinator requests. */
+        rd_refcnt_t creq_abs_refcnt; /**< Bounded refs, including direct
+                                      *   broker-thread DESTROY callbacks. */
         rd_bool_t creq_done; /**< True if request was sent */
 
         rd_kafka_broker_t *creq_rkb; /**< creq is waiting for this broker to
@@ -124,6 +128,49 @@ void rd_kafka_coord_req(rd_kafka_t *rk,
                         rd_kafka_replyq_t replyq,
                         rd_kafka_resp_cb_t *resp_cb,
                         void *reply_opaque);
+
+/* Required-TV2 only. The caller supplies the original monotonic deadline,
+ * and retains responsibility for enforcing it in the mutation sender. */
+#if defined(__GNUC__) && !defined(_WIN32)
+__attribute__((visibility("hidden")))
+#endif
+void rd_kafka_coord_req_abs(rd_kafka_t *rk,
+                            rd_kafka_coordtype_t coordtype,
+                            const char *coordkey,
+                            rd_kafka_send_req_cb_t *send_req_cb,
+                            rd_kafka_op_t *rko,
+                            rd_ts_t abs_timeout,
+                            rd_kafka_replyq_t replyq,
+                            rd_kafka_resp_cb_t *resp_cb,
+                            void *reply_opaque);
+
+/* Used only for a definitive broker-negative TV2 retry. Unlike the legacy
+ * relative-timeout API, delay_ms does not extend the original deadline. */
+#if defined(__GNUC__) && !defined(_WIN32)
+__attribute__((visibility("hidden")))
+#endif
+void rd_kafka_coord_req_abs_delayed(rd_kafka_t *rk,
+                                    rd_kafka_coordtype_t coordtype,
+                                    const char *coordkey,
+                                    rd_kafka_send_req_cb_t *send_req_cb,
+                                    rd_kafka_op_t *rko,
+                                    int delay_ms,
+                                    rd_ts_t abs_timeout,
+                                    rd_kafka_replyq_t replyq,
+                                    rd_kafka_resp_cb_t *resp_cb,
+                                    void *reply_opaque);
+
+#if defined(__GNUC__) && !defined(_WIN32)
+__attribute__((visibility("hidden")))
+#endif
+rd_kafka_resp_err_t rd_kafka_FindCoordinatorRequest_abs(
+    rd_kafka_broker_t *rkb,
+    rd_kafka_coordtype_t coordtype,
+    const char *coordkey,
+    rd_ts_t abs_timeout,
+    rd_kafka_replyq_t replyq,
+    rd_kafka_resp_cb_t *resp_cb,
+    void *opaque);
 
 void rd_kafka_coord_rkb_monitor_cb(rd_kafka_broker_t *rkb);
 

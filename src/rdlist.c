@@ -350,6 +350,10 @@ void *rd_list_find(const rd_list_t *rl,
         int i;
         const void *elem;
 
+        /* An empty sorted list has no allocation to pass to bsearch(). */
+        if (rl->rl_cnt == 0)
+                return NULL;
+
         if (rl->rl_flags & RD_LIST_F_SORTED) {
                 void **r;
                 rd_list_cmp_curr = cmp;

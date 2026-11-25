@@ -32,6 +32,14 @@
 
 #include <stdio.h>
 
+/* C99's standard function-name identifier avoids the GNU extension warning
+ * in strict builds, while preserving the existing C90/MSVC fallback. */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+#define RD_UT_FUNCTION_NAME __func__
+#else
+#define RD_UT_FUNCTION_NAME __FUNCTION__
+#endif
+
 
 extern rd_bool_t rd_unittest_assert_on_failure;
 extern rd_bool_t rd_unittest_on_ci;
@@ -47,7 +55,7 @@ extern rd_bool_t rd_unittest_slow;
  */
 #define RD_UT_BEGIN()                                                          \
         fprintf(stderr, "\033[34mRDUT: INFO: %s:%d: %s: BEGIN: \033[0m\n",     \
-                __FILE__, __LINE__, __FUNCTION__)
+                __FILE__, __LINE__, RD_UT_FUNCTION_NAME)
 
 
 /**
@@ -56,7 +64,7 @@ extern rd_bool_t rd_unittest_slow;
 #define RD_UT_FAIL(...)                                                        \
         do {                                                                   \
                 fprintf(stderr, "\033[31mRDUT: FAIL: %s:%d: %s: ", __FILE__,   \
-                        __LINE__, __FUNCTION__);                               \
+                        __LINE__, RD_UT_FUNCTION_NAME);                       \
                 fprintf(stderr, __VA_ARGS__);                                  \
                 fprintf(stderr, "\033[0m\n");                                  \
                 if (rd_unittest_assert_on_failure)                             \
@@ -70,7 +78,7 @@ extern rd_bool_t rd_unittest_slow;
 #define RD_UT_PASS()                                                           \
         do {                                                                   \
                 fprintf(stderr, "\033[32mRDUT: PASS: %s:%d: %s\033[0m\n",      \
-                        __FILE__, __LINE__, __FUNCTION__);                     \
+                        __FILE__, __LINE__, RD_UT_FUNCTION_NAME);             \
                 return 0;                                                      \
         } while (0)
 
@@ -80,7 +88,7 @@ extern rd_bool_t rd_unittest_slow;
 #define RD_UT_SKIP(...)                                                        \
         do {                                                                   \
                 fprintf(stderr, "\033[33mRDUT: SKIP: %s:%d: %s: ", __FILE__,   \
-                        __LINE__, __FUNCTION__);                               \
+                        __LINE__, RD_UT_FUNCTION_NAME);                       \
                 fprintf(stderr, __VA_ARGS__);                                  \
                 fprintf(stderr, "\033[0m\n");                                  \
                 return 0;                                                      \
@@ -96,7 +104,7 @@ extern rd_bool_t rd_unittest_slow;
                         fprintf(stderr,                                        \
                                 "\033[31mRDUT: FAIL: %s:%d: %s: "              \
                                 "assert failed: " #expr ": ",                  \
-                                __FILE__, __LINE__, __FUNCTION__);             \
+                                __FILE__, __LINE__, RD_UT_FUNCTION_NAME);     \
                         fprintf(stderr, __VA_ARGS__);                          \
                         fprintf(stderr, "\033[0m\n");                          \
                         if (rd_unittest_assert_on_failure)                     \
@@ -124,7 +132,7 @@ extern rd_bool_t rd_unittest_slow;
 #define RD_UT_SAY(...)                                                         \
         do {                                                                   \
                 fprintf(stderr, "RDUT: INFO: %s:%d: %s: ", __FILE__, __LINE__, \
-                        __FUNCTION__);                                         \
+                        RD_UT_FUNCTION_NAME);                                  \
                 fprintf(stderr, __VA_ARGS__);                                  \
                 fprintf(stderr, "\n");                                         \
         } while (0)
@@ -136,7 +144,7 @@ extern rd_bool_t rd_unittest_slow;
 #define RD_UT_WARN(...)                                                        \
         do {                                                                   \
                 fprintf(stderr, "\033[33mRDUT: WARN: %s:%d: %s: ", __FILE__,   \
-                        __LINE__, __FUNCTION__);                               \
+                        __LINE__, RD_UT_FUNCTION_NAME);                       \
                 fprintf(stderr, __VA_ARGS__);                                  \
                 fprintf(stderr, "\033[0m\n");                                  \
         } while (0)
@@ -200,7 +208,7 @@ int rd_unittest(void);
  * @brief Register code as covered/executed.
  */
 #define RD_UT_COVERAGE(COVNR)                                                  \
-        rd_ut_coverage(__FILE__, __FUNCTION__, __LINE__, COVNR)
+        rd_ut_coverage(__FILE__, RD_UT_FUNCTION_NAME, __LINE__, COVNR)
 
 /**
  * @returns how many times the code was executed.
@@ -208,7 +216,7 @@ int rd_unittest(void);
  *          been executed.
  */
 #define RD_UT_COVERAGE_CHECK(COVNR)                                            \
-        rd_ut_coverage_check(__FILE__, __FUNCTION__, __LINE__, COVNR)
+        rd_ut_coverage_check(__FILE__, RD_UT_FUNCTION_NAME, __LINE__, COVNR)
 
 
 void rd_ut_coverage(const char *file, const char *func, int line, int covnr);

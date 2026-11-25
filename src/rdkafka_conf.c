@@ -1612,6 +1612,11 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
      "This is also the default timeout value if no timeout (-1) is "
      "supplied to the transactional API methods.",
      1000, INT_MAX, 60000},
+    {_RK_GLOBAL | _RK_PRODUCER | _RK_MED, "transaction.tv2.required", _RK_C_BOOL,
+     _RK(eos.transaction_tv2_required),
+     "Require finalized transaction.version=2 and TV2 transaction RPCs. "
+     "Experimental; do not recover an ambiguous transaction or identity.",
+     .vmin = 0, .vmax = 1, .vdef = 0},
     {_RK_GLOBAL | _RK_PRODUCER | _RK_HIGH, "enable.idempotence", _RK_C_BOOL,
      _RK(eos.idempotence),
      "When set to `true`, the producer will ensure that messages are "
@@ -4576,6 +4581,10 @@ const char *rd_kafka_conf_finalize(rd_kafka_type_t cltype,
                 conf->eos.idempotence = 0;
 
         } else if (cltype == RD_KAFKA_PRODUCER) {
+                if (conf->eos.transaction_tv2_required &&
+                    (!conf->eos.transactional_id || !conf->api_version_request))
+                        return "`transaction.tv2.required` requires "
+                               "`transactional.id` and `api.version.request=true`";
                 if (conf->eos.transactional_id) {
                         if (!conf->eos.idempotence) {
                                 /* Auto enable idempotence unless

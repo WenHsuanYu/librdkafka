@@ -688,7 +688,7 @@ rd_kafka_replyq_make(rd_kafka_q_t *rkq, int version, const char *id) {
 /* Construct temporary on-stack replyq with increased Q refcount and
  * optional VERSION. */
 #define RD_KAFKA_REPLYQ(Q, VERSION)                                            \
-        rd_kafka_replyq_make(Q, VERSION, __FUNCTION__)
+        rd_kafka_replyq_make(Q, VERSION, __func__)
 
 /* Construct temporary on-stack replyq for indicating no replyq. */
 #if ENABLE_DEVEL
