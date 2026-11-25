@@ -124,16 +124,21 @@ static const char *rd_kafka_jwt_b64_decode_payload(const char *src,
 
         const char *errstr = NULL;
 
+        size_t src_len;
         int i, padding, len;
 
         int payload_len;
-        int nbytesdecoded;
+        int nbytesdecoded, decoded_len, trailing_padding = 0;
 
         int payloads_start = 0;
         int payloads_end   = 0;
 
-        len           = (int)strlen(src);
-        converted_src = rd_malloc(len + 4);
+        *bufplainp = NULL;
+        src_len    = strlen(src);
+        if (src_len > INT_MAX - 4)
+                return "JWT token is too long";
+        len           = (int)src_len;
+        converted_src = rd_malloc(src_len + 4);
 
         for (i = 0; i < len; i++) {
                 switch (src[i]) {
@@ -170,8 +175,12 @@ static const char *rd_kafka_jwt_b64_decode_payload(const char *src,
         }
 
         payload_len = payloads_end - payloads_start;
+        if (payload_len % 4 == 1) {
+                errstr = "Invalid base64 payload length";
+                goto done;
+        }
         payload     = rd_malloc(payload_len + 4);
-        strncpy(payload, (converted_src + payloads_start), payload_len);
+        memcpy(payload, converted_src + payloads_start, payload_len);
 
         padding = 4 - (payload_len % 4);
         if (padding < 4) {
@@ -179,12 +188,27 @@ static const char *rd_kafka_jwt_b64_decode_payload(const char *src,
                         payload[payload_len++] = '=';
         }
 
+        while (trailing_padding < payload_len &&
+               payload[payload_len - trailing_padding - 1] == '=')
+                trailing_padding++;
+        if (trailing_padding > 2) {
+                errstr = "Invalid base64 payload padding";
+                goto done;
+        }
+
         nbytesdecoded = ((payload_len + 3) / 4) * 3;
         *bufplainp    = rd_malloc(nbytesdecoded + 1);
 
-        if (EVP_DecodeBlock((uint8_t *)(*bufplainp), (uint8_t *)payload,
-                            (int)payload_len) == -1) {
+        decoded_len = EVP_DecodeBlock((uint8_t *)(*bufplainp),
+                                      (uint8_t *)payload, payload_len);
+        if (decoded_len < trailing_padding) {
                 errstr = "Failed to decode base64 payload";
+        } else {
+                decoded_len -= trailing_padding;
+                if (memchr(*bufplainp, '\0', decoded_len))
+                        errstr = "Decoded JWT payload contains a NUL byte";
+                else
+                        (*bufplainp)[decoded_len] = '\0';
         }
 
 done:
@@ -1398,6 +1422,56 @@ static int ut_sasl_oauthbearer_oidc_post_fields_with_empty_scope(void) {
         "fakesignature"
 
 /**
+ * @brief Decoded JWT payloads must be terminated at their actual byte length.
+ */
+static int ut_sasl_oauthbearer_oidc_payload_decode(void) {
+        static const struct {
+                const char *token;
+                const char *decoded;
+        } cases[] = {
+            {"header.Zg.signature", "f"},     {"header.Zm8.signature", "fo"},
+            {"header.Zm9v.signature", "foo"}, {"header.Zg==.signature", "f"},
+            {"header.Zm8=.signature", "fo"},  {"header.e30.signature", "{}"},
+        };
+        static const char *invalid[] = {
+            "missing-delimiters",    "header.e30.signature.extra",
+            "header.Y.signature",    "header.%%%%.signature",
+            "header.YQBi.signature", /* Decodes to a NUL-containing payload. */
+        };
+        size_t i;
+
+        RD_UT_BEGIN();
+
+        for (i = 0; i < RD_ARRAYSIZE(cases); i++) {
+                char *decoded = NULL;
+                const char *err =
+                    rd_kafka_jwt_b64_decode_payload(cases[i].token, &decoded);
+
+                RD_UT_ASSERT(err == NULL && decoded != NULL,
+                             "Failed to decode case %" PRIusz ": %s", i,
+                             err ? err : "missing payload");
+                RD_UT_ASSERT(
+                    !strcmp(decoded, cases[i].decoded),
+                    "Incorrect decoded or unterminated payload case %" PRIusz,
+                    i);
+                rd_free(decoded);
+        }
+
+        for (i = 0; i < RD_ARRAYSIZE(invalid); i++) {
+                char *decoded = NULL;
+                const char *err =
+                    rd_kafka_jwt_b64_decode_payload(invalid[i], &decoded);
+
+                RD_UT_ASSERT(
+                    err != NULL,
+                    "Expected malformed JWT payload %" PRIusz " to fail", i);
+                RD_IF_FREE(decoded, rd_free);
+        }
+
+        RD_UT_PASS();
+}
+
+/**
  * @brief Verifies the extraction logic of the subject from the configured JWT
  * claim name, falls back to "sub" when unconfigured, and rejects missing or
  * empty claim values.
@@ -1483,6 +1557,7 @@ int unittest_sasl_oauthbearer_oidc(void) {
         fails += ut_sasl_oauthbearer_oidc_with_empty_key();
         fails += ut_sasl_oauthbearer_oidc_post_fields();
         fails += ut_sasl_oauthbearer_oidc_post_fields_with_empty_scope();
+        fails += ut_sasl_oauthbearer_oidc_payload_decode();
         fails += ut_sasl_oauthbearer_oidc_sub_claim_name();
         return fails;
 }
